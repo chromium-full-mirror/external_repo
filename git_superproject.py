@@ -59,7 +59,7 @@ class CommitIdsResult(NamedTuple):
 class UpdateProjectsResult(NamedTuple):
   """Return the overriding manifest file and whether caller should exit."""
 
-  # Path name of the overriding manfiest file if successful, otherwise None.
+  # Path name of the overriding manifest file if successful, otherwise None.
   manifest_path: str
   # Whether the caller should exit.
   fatal: bool
@@ -73,7 +73,7 @@ class Superproject(object):
   is a dictionary with project/commit id entries.
   """
   def __init__(self, manifest, repodir, git_event_log,
-               superproject_dir='exp-superproject', quiet=False):
+               superproject_dir='exp-superproject', quiet=False, print_messages=False):
     """Initializes superproject.
 
     Args:
@@ -83,11 +83,13 @@ class Superproject(object):
       git_event_log: A git trace2 event log to log events.
       superproject_dir: Relative path under |repodir| to checkout superproject.
       quiet:  If True then only print the progress messages.
+      print_messages: if True then print error/warning messages.
     """
     self._project_commit_ids = None
     self._manifest = manifest
     self._git_event_log = git_event_log
     self._quiet = quiet
+    self._print_messages = print_messages
     self._branch = self._GetBranch()
     self._repodir = os.path.abspath(repodir)
     self._superproject_dir = superproject_dir
@@ -122,10 +124,19 @@ class Superproject(object):
       branch = branch[len(R_HEADS):]
     return branch
 
-  def _LogError(self, message):
+  def _LogMessage(self, message):
     """Logs message to stderr and _git_event_log."""
-    print(message, file=sys.stderr)
+    if self._print_messages:
+      print(message, file=sys.stderr)
     self._git_event_log.ErrorEvent(message, '')
+
+  def _LogError(self, message):
+    """Logs error message to stderr and _git_event_log."""
+    self._LogMessage(f'repo superproject error: {message}')
+
+  def _LogWarning(self, message):
+    """Logs warning message to stderr and _git_event_log."""
+    self._LogMessage(f'repo superproject warning: {message}')
 
   def _Init(self):
     """Sets up a local Git repository to get a copy of a superproject.
@@ -146,8 +157,8 @@ class Superproject(object):
                    capture_stderr=True)
     retval = p.Wait()
     if retval:
-      self._LogError(f'repo: error: git init call failed, command: git {cmd}, '
-                     f'return code: {retval}, stderr: {p.stderr}')
+      self._LogWarning(f'git init call failed, command: git {cmd}, '
+                       f'return code: {retval}, stderr: {p.stderr}')
       return False
     return True
 
@@ -161,10 +172,10 @@ class Superproject(object):
       True if fetch is successful, or False.
     """
     if not os.path.exists(self._work_git):
-      self._LogError(f'git fetch missing directory: {self._work_git}')
+      self._LogWarning(f'git fetch missing directory: {self._work_git}')
       return False
     if not git_require((2, 28, 0)):
-      print('superproject requires a git version 2.28 or later', file=sys.stderr)
+      self._LogWarning('superproject requires a git version 2.28 or later')
       return False
     cmd = ['fetch', url, '--depth', '1', '--force', '--no-tags', '--filter', 'blob:none']
     if self._branch:
@@ -176,8 +187,8 @@ class Superproject(object):
                    capture_stderr=True)
     retval = p.Wait()
     if retval:
-      self._LogError(f'repo: error: git fetch call failed, command: git {cmd}, '
-                     f'return code: {retval}, stderr: {p.stderr}')
+      self._LogWarning(f'git fetch call failed, command: git {cmd}, '
+                       f'return code: {retval}, stderr: {p.stderr}')
       return False
     return True
 
@@ -190,7 +201,7 @@ class Superproject(object):
       data: data returned from 'git ls-tree ...' instead of None.
     """
     if not os.path.exists(self._work_git):
-      self._LogError(f'git ls-tree missing directory: {self._work_git}')
+      self._LogWarning(f'git ls-tree missing directory: {self._work_git}')
       return None
     data = None
     branch = 'HEAD' if not self._branch else self._branch
@@ -205,8 +216,8 @@ class Superproject(object):
     if retval == 0:
       data = p.stdout
     else:
-      self._LogError(f'repo: error: git ls-tree call failed, command: git {cmd}, '
-                     f'return code: {retval}, stderr: {p.stderr}')
+      self._LogWarning(f'git ls-tree call failed, command: git {cmd}, '
+                       f'return code: {retval}, stderr: {p.stderr}')
     return data
 
   def Sync(self):
@@ -215,19 +226,18 @@ class Superproject(object):
     Returns:
       SyncResult
     """
-    print('NOTICE: --use-superproject is in beta; report any issues to the '
-          'address described in `repo version`', file=sys.stderr)
-
     if not self._manifest.superproject:
-      self._LogError(f'repo error: superproject tag is not defined in manifest: '
-                     f'{self._manifest.manifestFile}')
+      self._LogWarning(f'superproject tag is not defined in manifest: '
+                       f'{self._manifest.manifestFile}')
       return SyncResult(False, False)
 
+    print('NOTICE: --use-superproject is in beta; report any issues to the '
+          'address described in `repo version`', file=sys.stderr)
     should_exit = True
     url = self._manifest.superproject['remote'].url
     if not url:
-      self._LogError(f'repo error: superproject URL is not defined in manifest: '
-                     f'{self._manifest.manifestFile}')
+      self._LogWarning(f'superproject URL is not defined in manifest: '
+                       f'{self._manifest.manifestFile}')
       return SyncResult(False, should_exit)
 
     if not self._Init():
@@ -250,8 +260,8 @@ class Superproject(object):
 
     data = self._LsTree()
     if not data:
-      print('warning: git ls-tree failed to return data for superproject',
-            file=sys.stderr)
+      self._LogWarning(f'warning: git ls-tree failed to return data for manifest: '
+                       f'{self._manifest.manifestFile}')
       return CommitIdsResult(None, True)
 
     # Parse lines like the following to select lines starting with '160000' and
@@ -270,14 +280,14 @@ class Superproject(object):
     self._project_commit_ids = commit_ids
     return CommitIdsResult(commit_ids, False)
 
-  def _WriteManfiestFile(self):
+  def _WriteManifestFile(self):
     """Writes manifest to a file.
 
     Returns:
       manifest_path: Path name of the file into which manifest is written instead of None.
     """
     if not os.path.exists(self._superproject_path):
-      self._LogError(f'error: missing superproject directory: {self._superproject_path}')
+      self._LogWarning(f'missing superproject directory: {self._superproject_path}')
       return None
     manifest_str = self._manifest.ToXml(groups=self._manifest.GetGroupsStr()).toxml()
     manifest_path = self._manifest_path
@@ -285,7 +295,7 @@ class Superproject(object):
       with open(manifest_path, 'w', encoding='utf-8') as fp:
         fp.write(manifest_str)
     except IOError as e:
-      self._LogError(f'error: cannot write manifest to : {manifest_path} {e}')
+      self._LogError(f'cannot write manifest to : {manifest_path} {e}')
       return None
     return manifest_path
 
@@ -321,7 +331,6 @@ class Superproject(object):
     commit_ids_result = self._GetAllProjectsCommitIds()
     commit_ids = commit_ids_result.commit_ids
     if not commit_ids:
-      print('warning: Cannot get project commit ids from manifest', file=sys.stderr)
       return UpdateProjectsResult(None, commit_ids_result.fatal)
 
     projects_missing_commit_ids = []
@@ -336,15 +345,15 @@ class Superproject(object):
     # If superproject doesn't have a commit id for a project, then report an
     # error event and continue as if do not use superproject is specified.
     if projects_missing_commit_ids:
-      self._LogError(f'error: please file a bug using {self._manifest.contactinfo.bugurl} '
-                     f'to report missing commit_ids for: {projects_missing_commit_ids}')
+      self._LogWarning(f'please file a bug using {self._manifest.contactinfo.bugurl} '
+                       f'to report missing commit_ids for: {projects_missing_commit_ids}')
       return UpdateProjectsResult(None, False)
 
     for project in projects:
       if not self._SkipUpdatingProjectRevisionId(project):
         project.SetRevisionId(commit_ids.get(project.relpath))
 
-    manifest_path = self._WriteManfiestFile()
+    manifest_path = self._WriteManifestFile()
     return UpdateProjectsResult(manifest_path, False)
 
 
@@ -352,7 +361,6 @@ class Superproject(object):
 def _UseSuperprojectFromConfiguration():
   """Returns the user choice of whether to use superproject."""
   user_cfg = RepoConfig.ForUser()
-  system_cfg = RepoConfig.ForSystem()
   time_now = int(time.time())
 
   user_value = user_cfg.GetBoolean('repo.superprojectChoice')
@@ -367,6 +375,7 @@ def _UseSuperprojectFromConfiguration():
     return user_value
 
   # We don't have an unexpired choice, ask for one.
+  system_cfg = RepoConfig.ForSystem()
   system_value = system_cfg.GetBoolean('repo.superprojectChoice')
   if system_value:
     # The system configuration is proposing that we should enable the
@@ -411,6 +420,11 @@ def _UseSuperprojectFromConfiguration():
 
   # For all other cases, we would not use superproject by default.
   return False
+
+
+def PrintMessages(opt, manifest):
+  """Returns a boolean if error/warning messages are to be printed."""
+  return opt.use_superproject is not None or manifest.superproject
 
 
 def UseSuperproject(opt, manifest):
