@@ -127,6 +127,11 @@ to update the working directory files.
     # anew.
     if not is_new:
       was_standalone_manifest = m.config.GetString('manifest.standalone')
+      if was_standalone_manifest and not opt.manifest_url:
+        print('fatal: repo was initialized with a standlone manifest, '
+              'cannot be re-initialized without --manifest-url/-u')
+        sys.exit(1)
+
       if opt.standalone_manifest or (
           was_standalone_manifest and opt.manifest_url):
         m.config.ClearCache()
@@ -166,12 +171,14 @@ to update the working directory files.
     standalone_manifest = False
     if opt.standalone_manifest:
       standalone_manifest = True
-    elif not opt.manifest_url:
+      m.config.SetString('manifest.standalone', opt.manifest_url)
+    elif not opt.manifest_url and not opt.manifest_branch:
       # If -u is set and --standalone-manifest is not, then we're not in
       # standalone mode. Otherwise, use config to infer what we were in the last
       # init.
       standalone_manifest = bool(m.config.GetString('manifest.standalone'))
-    m.config.SetString('manifest.standalone', opt.manifest_url)
+    if not standalone_manifest:
+      m.config.SetString('manifest.standalone', None)
 
     self._ConfigureDepth(opt)
 
