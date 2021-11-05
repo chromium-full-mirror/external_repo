@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import errno
 import functools
 import http.cookiejar as cookielib
 import io
@@ -235,24 +234,21 @@ later is required to fix a server side protocol bug.
                  dest='fetch_submodules', action='store_true',
                  help='fetch submodules from server')
     p.add_option('--use-superproject', action='store_true',
-                 help='use the manifest superproject to sync projects')
+                 help='use the manifest superproject to sync projects; implies -c')
     p.add_option('--no-use-superproject', action='store_false',
                  dest='use_superproject',
                  help='disable use of manifest superprojects')
-    p.add_option('--tags',
-                 action='store_false',
+    p.add_option('--tags', action='store_true',
                  help='fetch tags')
     p.add_option('--no-tags',
                  dest='tags', action='store_false',
-                 help="don't fetch tags")
+                 help="don't fetch tags (default)")
     p.add_option('--optimized-fetch',
                  dest='optimized_fetch', action='store_true',
                  help='only fetch projects fixed to sha1 if revision does not exist locally')
     p.add_option('--retry-fetches',
                  default=0, action='store', type='int',
                  help='number of times to retry fetches on transient errors')
-    p.add_option('--prune', dest='prune', action='store_true',
-                 help='delete refs that no longer exist on the remote')
     p.add_option('--cache-dir', dest='cache_dir', action='store',
                  help='Use git-cache to populate project cache into this '
                       'directory. Bootstrap the local repository from this '
@@ -935,6 +931,9 @@ later is required to fix a server side protocol bug.
         self.OptionParser.error('-u and -p may only be combined with -s or -t')
       if None in [opt.manifest_server_username, opt.manifest_server_password]:
         self.OptionParser.error('both -u and -p must be given')
+
+    if opt.prune is None:
+      opt.prune = True
 
   def Execute(self, opt, args):
     if opt.jobs:
