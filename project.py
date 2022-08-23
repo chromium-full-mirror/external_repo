@@ -206,6 +206,7 @@ class ReviewableBranch(object):
                       private=False,
                       notify=None,
                       wip=False,
+                      ready=False,
                       dest_branch=None,
                       validate_certs=True,
                       push_options=None):
@@ -218,6 +219,7 @@ class ReviewableBranch(object):
                                  private=private,
                                  notify=notify,
                                  wip=wip,
+                                 ready=ready,
                                  dest_branch=dest_branch,
                                  validate_certs=validate_certs,
                                  push_options=push_options)
@@ -685,9 +687,13 @@ class Project(object):
       self._userident_name = ''
       self._userident_email = ''
 
-  def GetRemote(self, name):
+  def GetRemote(self, name=None):
     """Get the configuration for a single remote.
+
+    Defaults to the current project's remote.
     """
+    if name is None:
+      name = self.remote.name
     return self.config.GetRemote(name)
 
   def GetBranch(self, name):
@@ -1004,6 +1010,7 @@ class Project(object):
                       private=False,
                       notify=None,
                       wip=False,
+                      ready=False,
                       dest_branch=None,
                       validate_certs=True,
                       push_options=None):
@@ -1073,6 +1080,8 @@ class Project(object):
       opts += ['private']
     if wip:
       opts += ['wip']
+    if ready:
+      opts += ['ready']
     if opts:
       ref_spec = ref_spec + '%' + ','.join(opts)
     cmd.append(ref_spec)
@@ -1356,7 +1365,7 @@ class Project(object):
     if self.revisionId:
       return self.revisionId
 
-    rem = self.GetRemote(self.remote.name)
+    rem = self.GetRemote()
     rev = rem.ToLocal(self.revisionExpr)
 
     if all_refs is not None and rev in all_refs:
@@ -1548,7 +1557,7 @@ class Project(object):
                    "discarding %d commits removed from upstream",
                    len(local_changes) - cnt_mine)
 
-    branch.remote = self.GetRemote(self.remote.name)
+    branch.remote = self.GetRemote()
     if not ID_RE.match(self.revisionExpr):
       # in case of manifest sync the revisionExpr might be a SHA1
       branch.merge = self.revisionExpr
@@ -1606,7 +1615,7 @@ class Project(object):
   def DownloadPatchSet(self, change_id, patch_id):
     """Download a single patch set of a single change to FETCH_HEAD.
     """
-    remote = self.GetRemote(self.remote.name)
+    remote = self.GetRemote()
 
     cmd = ['fetch', remote.name]
     cmd.append('refs/changes/%2.2d/%d/%d'
@@ -1748,13 +1757,10 @@ class Project(object):
 
     all_refs = self.bare_ref.all
     if R_HEADS + name in all_refs:
-      return GitCommand(self,
-                        ['checkout', name, '--'],
-                        capture_stdout=True,
-                        capture_stderr=True).Wait() == 0
+      return GitCommand(self, ['checkout', '-q', name, '--']).Wait() == 0
 
     branch = self.GetBranch(name)
-    branch.remote = self.GetRemote(self.remote.name)
+    branch.remote = self.GetRemote()
     branch.merge = branch_merge
     if not branch.merge.startswith('refs/') and not ID_RE.match(branch_merge):
       branch.merge = R_HEADS + branch_merge
@@ -1776,10 +1782,7 @@ class Project(object):
       branch.Save()
       return True
 
-    if GitCommand(self,
-                  ['checkout', '-b', branch.name, revid],
-                  capture_stdout=True,
-                  capture_stderr=True).Wait() == 0:
+    if GitCommand(self, ['checkout', '-q', '-b', branch.name, revid]).Wait() == 0:
       branch.Save()
       return True
     return False
@@ -2122,7 +2125,7 @@ class Project(object):
       self.bare_git.rev_list('-1', '--missing=allow-any',
                              '%s^0' % self.revisionExpr, '--')
       if self.upstream:
-        rev = self.GetRemote(self.remote.name).ToLocal(self.upstream)
+        rev = self.GetRemote().ToLocal(self.upstream)
         self.bare_git.rev_list('-1', '--missing=allow-any',
                                '%s^0' % rev, '--')
         self.bare_git.merge_base('--is-ancestor', self.revisionExpr, rev)
@@ -2413,7 +2416,7 @@ class Project(object):
     if initial and (self.manifest.manifestProject.depth or self.clone_depth):
       return False
 
-    remote = self.GetRemote(self.remote.name)
+    remote = self.GetRemote()
     bundle_url = remote.url + '/clone.bundle'
     bundle_url = GitConfig.ForUser().UrlInsteadOf(bundle_url)
     if GetSchemeFromUrl(bundle_url) not in ('http', 'https',
@@ -2734,7 +2737,7 @@ class Project(object):
 
   def _InitRemote(self):
     if self.remote.url:
-      remote = self.GetRemote(self.remote.name)
+      remote = self.GetRemote()
       remote.url = self.remote.url
       remote.pushUrl = self.remote.pushUrl
       remote.review = self.remote.review
@@ -2747,6 +2750,7 @@ class Project(object):
       remote.Save()
 
   def _InitMRef(self):
+    """Initialize the pseudo m/<manifest branch> ref."""
     if self.manifest.branch:
       if self.use_git_worktrees:
         # Set up the m/ space to point to the worktree-specific ref space.
@@ -2776,6 +2780,16 @@ class Project(object):
     self._InitAnyMRef(HEAD, self.bare_git)
 
   def _InitAnyMRef(self, ref, active_git, detach=False):
+    """Initialize |ref| in |active_git| to the value in the manifest.
+
+    This points |ref| to the <project> setting in the manifest.
+
+    Args:
+      ref: The branch to update.
+      active_git: The git repository to make updates in.
+      detach: Whether to update target of symbolic refs, or overwrite the ref
+        directly (and thus make it non-symbolic).
+    """
     cur = self.bare_ref.symref(ref)
 
     if self.revisionId:
@@ -2784,7 +2798,7 @@ class Project(object):
         dst = self.revisionId + '^0'
         active_git.UpdateRef(ref, dst, message=msg, detach=True)
     else:
-      remote = self.GetRemote(self.remote.name)
+      remote = self.GetRemote()
       dst = remote.ToLocal(self.revisionExpr)
       if cur != dst:
         msg = 'manifest set to %s' % self.revisionExpr
@@ -2858,6 +2872,35 @@ class Project(object):
           raise DownloadError(self._get_symlink_error_message())
         else:
           raise
+
+  def _InitialCheckoutStart(self):
+    """Called when checking out a project for the first time.
+
+    This will use temporary non-visible paths so we can be safely interrupted
+    without leaving incomplete state behind.
+    """
+    paths = [f'{x}.tmp' for x in (self.relpath, self.worktree, self.gitdir, self.objdir)]
+    for p in paths:
+      platform_utils.rmtree(p, ignore_errors=True)
+    self.UpdatePaths(*paths)
+
+  def _InitialCheckoutFinalizeNetworkHalf(self):
+    """Finalize the object dirs after network syncing works."""
+    # Once the network half finishes, we can move the objects into the right
+    # place by removing the ".tmp" suffix on the dirs.
+    platform_utils.rmtree(self.gitdir[:-4], ignore_errors=True)
+    os.rename(self.gitdir, self.gitdir[:-4])
+    self.UpdatePaths(self.relpath, self.worktree, self.gitdir[:-4], self.objdir[:-4])
+
+  def _InitialCheckoutFinalizeLocalHalf(self):
+    """Finalize the initial checkout and make it available."""
+    assert self.gitdir == self.objdir
+    # Once the local half finishes, we can move the manifest dir into the right
+    # place by removing the ".tmp" suffix on the dirs.
+    platform_utils.rmtree(self.worktree[:-4], ignore_errors=True)
+    os.rename(self.worktree, self.worktree[:-4])
+    self.UpdatePaths(
+        self.relpath[:-4], self.worktree[:-4], self.gitdir, self.objdir)
 
   def _InitGitWorktree(self):
     """Init the project using git worktrees."""
@@ -3745,6 +3788,8 @@ class ManifestProject(MetaProject):
               (GitConfig.ForUser().UrlInsteadOf(manifest_url),),
               file=sys.stderr)
 
+      self._InitialCheckoutStart()
+
       # The manifest project object doesn't keep track of the path on the
       # server where this git is located, so let's save that here.
       mirrored_manifest_git = None
@@ -3776,7 +3821,7 @@ class ManifestProject(MetaProject):
 
     # Set the remote URL before the remote branch as we might need it below.
     if manifest_url:
-      r = self.GetRemote(self.remote.name)
+      r = self.GetRemote()
       r.url = manifest_url
       r.ResetFetch()
       r.Save()
@@ -3902,17 +3947,15 @@ class ManifestProject(MetaProject):
           clone_bundle=clone_bundle, current_branch_only=current_branch_only,
           tags=tags, submodules=submodules, clone_filter=clone_filter,
           partial_clone_exclude=self.manifest.PartialCloneExclude):
-        r = self.GetRemote(self.remote.name)
+        r = self.GetRemote()
         print('fatal: cannot obtain manifest %s' % r.url, file=sys.stderr)
-
-        # Better delete the manifest git dir if we created it; otherwise next
-        # time (when user fixes problems) we won't go through the "is_new" logic.
-        if is_new:
-          platform_utils.rmtree(self.gitdir)
         return False
 
       if manifest_branch:
         self.MetaBranchSwitch(submodules=submodules)
+
+      if is_new:
+        self._InitialCheckoutFinalizeNetworkHalf()
 
       syncbuf = SyncBuffer(self.config)
       self.Sync_LocalHalf(syncbuf, submodules=submodules)
@@ -3935,6 +3978,9 @@ class ManifestProject(MetaProject):
       os.makedirs(os.path.dirname(dest), exist_ok=True)
       with open(dest, 'wb') as f:
         f.write(manifest_data)
+
+    if is_new:
+      self._InitialCheckoutFinalizeLocalHalf()
 
     try:
       self.manifest.Link(manifest_name)
