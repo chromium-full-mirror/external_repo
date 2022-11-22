@@ -21,10 +21,12 @@ import multiprocessing
 import netrc
 from optparse import SUPPRESS_HELP
 import os
+import shutil
 import socket
 import sys
 import tempfile
 import time
+from typing import NamedTuple, List, Set
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -58,11 +60,68 @@ from error import RepoChangedException, GitError, ManifestParseError
 import platform_utils
 from project import SyncBuffer
 from progress import Progress
+from repo_trace import IsTrace, Trace
 import ssh
 from wrapper import Wrapper
 from manifest_xml import GitcManifest
 
 _ONE_DAY_S = 24 * 60 * 60
+# Env var to implicitly turn off object backups.
+REPO_BACKUP_OBJECTS = 'REPO_BACKUP_OBJECTS'
+
+_BACKUP_OBJECTS = os.environ.get(REPO_BACKUP_OBJECTS) != '0'
+
+
+class _FetchOneResult(NamedTuple):
+  """_FetchOne return value.
+
+  Attributes:
+    success (bool): True if successful.
+    project (Project): The fetched project.
+    start (float): The starting time.time().
+    finish (float): The ending time.time().
+    remote_fetched (bool): True if the remote was actually queried.
+  """
+  success: bool
+  project: Project
+  start: float
+  finish: float
+  remote_fetched: bool
+
+
+class _FetchResult(NamedTuple):
+  """_Fetch return value.
+
+  Attributes:
+    success (bool): True if successful.
+    projects (Set[str]): The names of the git directories of fetched projects.
+  """
+  success: bool
+  projects: Set[str]
+
+
+class _FetchMainResult(NamedTuple):
+  """_FetchMain return value.
+
+  Attributes:
+    all_projects (List[Project]): The fetched projects.
+  """
+  all_projects: List[Project]
+
+
+class _CheckoutOneResult(NamedTuple):
+  """_CheckoutOne return value.
+
+  Attributes:
+    success (bool): True if successful.
+    project (Project): The project.
+    start (float): The starting time.time().
+    finish (float): The ending time.time().
+  """
+  success: bool
+  project: Project
+  start: float
+  finish: float
 
 
 class Sync(Command, MirrorSafeCommand):
@@ -411,7 +470,7 @@ later is required to fix a server side protocol bug.
     success = False
     buf = io.StringIO()
     try:
-      success = project.Sync_NetworkHalf(
+      sync_result = project.Sync_NetworkHalf(
           quiet=opt.quiet,
           verbose=opt.verbose,
           output_redir=buf,
@@ -426,6 +485,7 @@ later is required to fix a server side protocol bug.
           ssh_proxy=self.ssh_proxy,
           clone_filter=project.manifest.CloneFilter,
           partial_clone_exclude=project.manifest.PartialCloneExclude)
+      success = sync_result.success
 
       output = buf.getvalue()
       if (opt.verbose or not success) and output:
@@ -443,7 +503,8 @@ later is required to fix a server side protocol bug.
       raise
 
     finish = time.time()
-    return (success, project, start, finish)
+    return _FetchOneResult(success, project, start, finish,
+                           sync_result.remote_fetched)
 
   @classmethod
   def _FetchInitChild(cls, ssh_proxy):
@@ -454,6 +515,7 @@ later is required to fix a server side protocol bug.
 
     jobs = opt.jobs_network
     fetched = set()
+    remote_fetched = set()
     pm = Progress('Fetching', len(projects), delay=False, quiet=opt.quiet)
 
     objdir_project_map = dict()
@@ -464,10 +526,16 @@ later is required to fix a server side protocol bug.
     def _ProcessResults(results_sets):
       ret = True
       for results in results_sets:
-        for (success, project, start, finish) in results:
+        for result in results:
+          success = result.success
+          project = result.project
+          start = result.start
+          finish = result.finish
           self._fetch_times.Set(project, finish - start)
           self.event_log.AddSync(project, event_log.TASK_SYNC_NETWORK,
                                  start, finish, success)
+          if result.remote_fetched:
+            remote_fetched.add(project)
           # Check for any errors before running any more tasks.
           # ...we'll let existing jobs finish, though.
           if not success:
@@ -525,7 +593,7 @@ later is required to fix a server side protocol bug.
     if not self.outer_client.manifest.IsArchive:
       self._GCProjects(projects, opt, err_event)
 
-    return (ret, fetched)
+    return _FetchResult(ret, fetched)
 
   def _FetchMain(self, opt, args, all_projects, err_event,
                  ssh_proxy, manifest):
@@ -551,7 +619,9 @@ later is required to fix a server side protocol bug.
     to_fetch.extend(all_projects)
     to_fetch.sort(key=self._fetch_times.Get, reverse=True)
 
-    success, fetched = self._Fetch(to_fetch, opt, err_event, ssh_proxy)
+    result = self._Fetch(to_fetch, opt, err_event, ssh_proxy)
+    success = result.success
+    fetched = result.projects
     if not success:
       err_event.set()
 
@@ -561,7 +631,7 @@ later is required to fix a server side protocol bug.
       if err_event.is_set():
         print('\nerror: Exited sync due to fetch errors.\n', file=sys.stderr)
         sys.exit(1)
-      return
+      return _FetchMainResult([])
 
     # Iteratively fetch missing and/or nested unregistered submodules
     previously_missing_set = set()
@@ -584,12 +654,14 @@ later is required to fix a server side protocol bug.
       if previously_missing_set == missing_set:
         break
       previously_missing_set = missing_set
-      success, new_fetched = self._Fetch(missing, opt, err_event, ssh_proxy)
+      result = self._Fetch(missing, opt, err_event, ssh_proxy)
+      success = result.success
+      new_fetched = result.projects
       if not success:
         err_event.set()
       fetched.update(new_fetched)
 
-    return all_projects
+    return _FetchMainResult(all_projects)
 
   def _CheckoutOne(self, detach_head, force_sync, project):
     """Checkout work tree for one project
@@ -621,7 +693,7 @@ later is required to fix a server side protocol bug.
     if not success:
       print('error: Cannot checkout %s' % (project.name), file=sys.stderr)
     finish = time.time()
-    return (success, project, start, finish)
+    return _CheckoutOneResult(success, project, start, finish)
 
   def _Checkout(self, all_projects, opt, err_results):
     """Checkout projects listed in all_projects
@@ -636,7 +708,11 @@ later is required to fix a server side protocol bug.
 
     def _ProcessResults(pool, pm, results):
       ret = True
-      for (success, project, start, finish) in results:
+      for result in results:
+        success = result.success
+        project = result.project
+        start = result.start
+        finish = result.finish
         self.event_log.AddSync(project, event_log.TASK_SYNC_LOCAL,
                                start, finish, success)
         # Check for any errors before running any more tasks.
@@ -657,6 +733,36 @@ later is required to fix a server side protocol bug.
         all_projects,
         callback=_ProcessResults,
         output=Progress('Checking out', len(all_projects), quiet=opt.quiet)) and not err_results
+
+  def _backup_cruft(self, bare_git):
+    """Save a copy of any cruft from `git gc`."""
+    # Find any cruft packs in the current gitdir, and save them.
+    # b/221065125 (repo sync complains that objects are missing).  This does
+    # not prevent that state, but makes it so that the missing objects are
+    # available.
+    objdir = bare_git._project.objdir
+    pack_dir = os.path.join(objdir, 'pack')
+    bak_dir = os.path.join(objdir, '.repo', 'pack.bak')
+    if not _BACKUP_OBJECTS or not platform_utils.isdir(pack_dir):
+      return
+    saved = []
+    files = set(platform_utils.listdir(pack_dir))
+    to_backup = []
+    for f in files:
+      base, ext = os.path.splitext(f)
+      if base + '.mtimes' in files:
+        to_backup.append(f)
+    if to_backup:
+      os.makedirs(bak_dir, exist_ok=True)
+    for fname in to_backup:
+      bak_fname = os.path.join(bak_dir, fname)
+      if not os.path.exists(bak_fname):
+        saved.append(fname)
+        # Use a tmp file so that we are sure of a complete copy.
+        shutil.copy(os.path.join(pack_dir, fname), bak_fname + '.tmp')
+        shutil.move(bak_fname + '.tmp', bak_fname)
+    if saved:
+      Trace('%s saved %s', bare_git._project.name, ' '.join(saved))
 
   def _GCProjects(self, projects, opt, err_event):
     pm = Progress('Garbage collecting', len(projects), delay=False, quiet=opt.quiet)
@@ -700,13 +806,22 @@ later is required to fix a server side protocol bug.
 
     jobs = opt.jobs
 
+    gc_args = ['--auto']
+    backup_cruft = False
+    if git_require((2, 37, 0)):
+      gc_args.append('--cruft')
+      backup_cruft = True
+    pack_refs_args = ()
     if jobs < 2:
       for (run_gc, bare_git) in tidy_dirs.values():
         pm.update(msg=bare_git._project.name)
+
         if run_gc:
-          bare_git.gc('--auto')
+          bare_git.gc(*gc_args)
         else:
-          bare_git.pack_refs()
+          bare_git.pack_refs(*pack_refs_args)
+        if backup_cruft:
+          self._backup_cruft(bare_git)
       pm.end()
       return
 
@@ -721,15 +836,17 @@ later is required to fix a server side protocol bug.
       try:
         try:
           if run_gc:
-            bare_git.gc('--auto', config=config)
+            bare_git.gc(*gc_args, config=config)
           else:
-            bare_git.pack_refs(config=config)
+            bare_git.pack_refs(*pack_refs_args, config=config)
         except GitError:
           err_event.set()
         except Exception:
           err_event.set()
           raise
       finally:
+        if backup_cruft:
+          self._backup_cruft(bare_git)
         pm.finish(bare_git._project.name)
         sem.release()
 
@@ -1090,14 +1207,13 @@ later is required to fix a server side protocol bug.
               file=sys.stderr)
 
     for m in self.ManifestList(opt):
-      mp = m.manifestProject
-      is_standalone_manifest = bool(mp.standalone_manifest_url)
-      if not is_standalone_manifest:
-        mp.PreSync()
+      if not m.manifestProject.standalone_manifest_url:
+        m.manifestProject.PreSync()
 
-      if opt.repo_upgraded:
-        _PostRepoUpgrade(m, quiet=opt.quiet)
+    if opt.repo_upgraded:
+      _PostRepoUpgrade(manifest, quiet=opt.quiet)
 
+    mp = manifest.manifestProject
     if opt.mp_update:
       self._UpdateAllManifestProjects(opt, mp, manifest_name)
     else:
@@ -1180,6 +1296,7 @@ later is required to fix a server side protocol bug.
 
     err_network_sync = False
     err_update_projects = False
+    err_update_linkfiles = False
 
     self._fetch_times = _FetchTimes(manifest)
     if not opt.local_only:
@@ -1187,8 +1304,9 @@ later is required to fix a server side protocol bug.
         with ssh.ProxyManager(manager) as ssh_proxy:
           # Initialize the socket dir once in the parent.
           ssh_proxy.sock()
-          all_projects = self._FetchMain(opt, args, all_projects, err_event,
-                                         ssh_proxy, manifest)
+          result = self._FetchMain(opt, args, all_projects, err_event,
+                                   ssh_proxy, manifest)
+          all_projects = result.all_projects
 
       if opt.network_only:
         return
