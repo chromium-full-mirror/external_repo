@@ -42,7 +42,7 @@ from error import ManifestInvalidRevisionError, ManifestInvalidPathError
 from error import NoManifestException, ManifestParseError
 import platform_utils
 import progress
-from repo_trace import IsTrace, Trace
+from repo_trace import Trace
 
 from git_refs import GitRefs, HEAD, R_HEADS, R_TAGS, R_PUB, R_M, R_WORKTREE_M
 
@@ -60,7 +60,7 @@ MAXIMUM_RETRY_SLEEP_SEC = 3600.0
 # +-10% random jitter is added to each Fetches retry sleep duration.
 RETRY_JITTER_PERCENT = 0.1
 
-# Whether to use alternates.
+# Whether to use alternates.  Switching back and forth is *NOT* supported.
 # TODO(vapier): Remove knob once behavior is verified.
 _ALTERNATES = os.environ.get('REPO_USE_ALTERNATES') == '1'
 
@@ -2495,16 +2495,16 @@ class Project(object):
         srcUrl = 'http' + srcUrl[len('persistent-http'):]
       cmd += [srcUrl]
 
-      if IsTrace():
-        Trace('%s', ' '.join(cmd))
-      if verbose:
-        print('%s: Downloading bundle: %s' % (self.name, srcUrl))
-      stdout = None if verbose else subprocess.PIPE
-      stderr = None if verbose else subprocess.STDOUT
-      try:
-        proc = subprocess.Popen(cmd, stdout=stdout, stderr=stderr)
-      except OSError:
-        return False
+      proc = None
+      with Trace('Fetching bundle: %s', ' '.join(cmd)):
+        if verbose:
+          print('%s: Downloading bundle: %s' % (self.name, srcUrl))
+        stdout = None if verbose else subprocess.PIPE
+        stderr = None if verbose else subprocess.STDOUT
+        try:
+          proc = subprocess.Popen(cmd, stdout=stdout, stderr=stderr)
+        except OSError:
+          return False
 
       (output, _) = proc.communicate()
       curlret = proc.returncode
