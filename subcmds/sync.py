@@ -21,7 +21,6 @@ import multiprocessing
 import netrc
 from optparse import SUPPRESS_HELP
 import os
-import shutil
 import socket
 import sys
 import tempfile
@@ -66,11 +65,9 @@ from wrapper import Wrapper
 from manifest_xml import GitcManifest
 
 _ONE_DAY_S = 24 * 60 * 60
-# Env var to implicitly turn off object backups.
-REPO_BACKUP_OBJECTS = 'REPO_BACKUP_OBJECTS'
-_BACKUP_OBJECTS = os.environ.get(REPO_BACKUP_OBJECTS) != '0'
 
-# Env var to implicitly turn auto-gc back on.
+# Env var to implicitly turn auto-gc back on.  This was added to allow a user to
+# revert a change in default behavior in v2.29.9.  Remove after 2023-04-01.
 _REPO_AUTO_GC = 'REPO_AUTO_GC'
 _AUTO_GC = os.environ.get(_REPO_AUTO_GC) == '1'
 
@@ -478,6 +475,7 @@ later is required to fix a server side protocol bug.
     """
     start = time.time()
     success = False
+    remote_fetched = False
     buf = io.StringIO()
     try:
       sync_result = project.Sync_NetworkHalf(
@@ -496,6 +494,7 @@ later is required to fix a server side protocol bug.
           clone_filter=project.manifest.CloneFilter,
           partial_clone_exclude=project.manifest.PartialCloneExclude)
       success = sync_result.success
+      remote_fetched = sync_result.remote_fetched
 
       output = buf.getvalue()
       if (opt.verbose or not success) and output:
@@ -513,8 +512,7 @@ later is required to fix a server side protocol bug.
       raise
 
     finish = time.time()
-    return _FetchOneResult(success, project, start, finish,
-                           sync_result.remote_fetched)
+    return _FetchOneResult(success, project, start, finish, remote_fetched)
 
   @classmethod
   def _FetchInitChild(cls, ssh_proxy):
@@ -744,33 +742,6 @@ later is required to fix a server side protocol bug.
         callback=_ProcessResults,
         output=Progress('Checking out', len(all_projects), quiet=opt.quiet)) and not err_results
 
-  def _backup_cruft(self, bare_git):
-    """Save a copy of any cruft from `git gc`."""
-    # Find any cruft packs in the current gitdir, and save them.
-    # b/221065125 (repo sync complains that objects are missing).  This does
-    # not prevent that state, but makes it so that the missing objects are
-    # available.
-    objdir = bare_git._project.objdir
-    pack_dir = os.path.join(objdir, 'pack')
-    bak_dir = os.path.join(objdir, '.repo', 'pack.bak')
-    if not _BACKUP_OBJECTS or not platform_utils.isdir(pack_dir):
-      return
-    files = set(platform_utils.listdir(pack_dir))
-    to_backup = []
-    for f in files:
-      base, ext = os.path.splitext(f)
-      if base + '.mtimes' in files:
-        to_backup.append(f)
-    if to_backup:
-      os.makedirs(bak_dir, exist_ok=True)
-    for fname in to_backup:
-      bak_fname = os.path.join(bak_dir, fname)
-      if not os.path.exists(bak_fname):
-        with Trace('%s saved %s', bare_git._project.name, fname):
-          # Use a tmp file so that we are sure of a complete copy.
-          shutil.copy(os.path.join(pack_dir, fname), bak_fname + '.tmp')
-          shutil.move(bak_fname + '.tmp', bak_fname)
-
   @staticmethod
   def _GetPreciousObjectsState(project: Project, opt):
     """Get the preciousObjects state for the project.
@@ -810,19 +781,18 @@ later is required to fix a server side protocol bug.
     print(f'\r{relpath}: project not found in manifest.', file=sys.stderr)
     return False
 
-  def _RepairPreciousObjectsState(self, project: Project, opt):
+  def _SetPreciousObjectsState(self, project: Project, opt):
     """Correct the preciousObjects state for the project.
 
     Args:
-      project (Project): the project to examine, and possibly correct.
-      opt (optparse.Values): options given to sync.
+      project: the project to examine, and possibly correct.
+      opt: options given to sync.
     """
     expected = self._GetPreciousObjectsState(project, opt)
     actual = project.config.GetBoolean('extensions.preciousObjects') or False
-    relpath = project.RelPath(local = opt.this_manifest_only)
+    relpath = project.RelPath(local=opt.this_manifest_only)
 
-    if (expected != actual and
-        not project.config.GetBoolean('repo.preservePreciousObjects')):
+    if expected != actual:
       # If this is unexpected, log it and repair.
       Trace(f'{relpath} expected preciousObjects={expected}, got {actual}')
       if expected:
@@ -851,13 +821,19 @@ later is required to fix a server side protocol bug.
     to potentially mark objects precious, so that `git gc` does not discard
     shared objects.
     """
-    pm = Progress(f'{"" if opt.auto_gc else "NOT "}Garbage collecting',
-                  len(projects), delay=False, quiet=opt.quiet)
+    if not opt.auto_gc:
+      # Just repair preciousObjects state, and return.
+      for project in projects:
+        self._SetPreciousObjectsState(project, opt)
+      return
+
+    pm = Progress('Garbage collecting', len(projects), delay=False,
+                  quiet=opt.quiet)
     pm.update(inc=0, msg='prescan')
 
     tidy_dirs = {}
     for project in projects:
-      self._RepairPreciousObjectsState(project, opt)
+      self._SetPreciousObjectsState(project, opt)
 
       project.config.SetString('gc.autoDetach', 'false')
       # Only call git gc once per objdir, but call pack-refs for the remainder.
@@ -872,28 +848,16 @@ later is required to fix a server side protocol bug.
             project.bare_git,
         )
 
-    if not opt.auto_gc:
-      pm.end()
-      return
-
     jobs = opt.jobs
 
-    gc_args = ['--auto']
-    backup_cruft = False
-    if git_require((2, 37, 0)):
-      gc_args.append('--cruft')
-      backup_cruft = True
-    pack_refs_args = ()
     if jobs < 2:
       for (run_gc, bare_git) in tidy_dirs.values():
         pm.update(msg=bare_git._project.name)
 
         if run_gc:
-          bare_git.gc(*gc_args)
+          bare_git.gc('--auto')
         else:
-          bare_git.pack_refs(*pack_refs_args)
-        if backup_cruft:
-          self._backup_cruft(bare_git)
+          bare_git.pack_refs()
       pm.end()
       return
 
@@ -908,17 +872,15 @@ later is required to fix a server side protocol bug.
       try:
         try:
           if run_gc:
-            bare_git.gc(*gc_args, config=config)
+            bare_git.gc('--auto', config=config)
           else:
-            bare_git.pack_refs(*pack_refs_args, config=config)
+            bare_git.pack_refs(config=config)
         except GitError:
           err_event.set()
         except Exception:
           err_event.set()
           raise
       finally:
-        if backup_cruft:
-          self._backup_cruft(bare_git)
         pm.finish(bare_git._project.name)
         sem.release()
 
@@ -1231,8 +1193,48 @@ later is required to fix a server side protocol bug.
 
     if opt.auto_gc is None and _AUTO_GC:
       print(f"Will run `git gc --auto` because {_REPO_AUTO_GC} is set.",
-            file=sys.stderr)
+            f'{_REPO_AUTO_GC} is deprecated and will be removed in a future',
+            'release.  Use `--auto-gc` instead.', file=sys.stderr)
       opt.auto_gc = True
+
+  def _ValidateOptionsWithManifest(self, opt, mp):
+    """Like ValidateOptions, but after we've updated the manifest.
+
+    Needed to handle sync-xxx option defaults in the manifest.
+
+    Args:
+      opt: The options to process.
+      mp: The manifest project to pull defaults from.
+    """
+    if not opt.jobs:
+      # If the user hasn't made a choice, use the manifest value.
+      opt.jobs = mp.manifest.default.sync_j
+    if opt.jobs:
+      # If --jobs has a non-default value, propagate it as the default for
+      # --jobs-xxx flags too.
+      if not opt.jobs_network:
+        opt.jobs_network = opt.jobs
+      if not opt.jobs_checkout:
+        opt.jobs_checkout = opt.jobs
+    else:
+      # Neither user nor manifest have made a choice, so setup defaults.
+      if not opt.jobs_network:
+        opt.jobs_network = 1
+      if not opt.jobs_checkout:
+        opt.jobs_checkout = DEFAULT_LOCAL_JOBS
+      opt.jobs = os.cpu_count()
+
+    # Try to stay under user rlimit settings.
+    #
+    # Since each worker requires at 3 file descriptors to run `git fetch`, use
+    # that to scale down the number of jobs.  Unfortunately there isn't an easy
+    # way to determine this reliably as systems change, but it was last measured
+    # by hand in 2011.
+    soft_limit, _ = _rlimit_nofile()
+    jobs_soft_limit = max(1, (soft_limit - 5) // 3)
+    opt.jobs = min(opt.jobs, jobs_soft_limit)
+    opt.jobs_network = min(opt.jobs_network, jobs_soft_limit)
+    opt.jobs_checkout = min(opt.jobs_checkout, jobs_soft_limit)
 
   def Execute(self, opt, args):
     manifest = self.outer_manifest
@@ -1296,35 +1298,9 @@ later is required to fix a server side protocol bug.
     else:
       print('Skipping update of local manifest project.')
 
-    # Now that the manifests are up-to-date, setup the jobs value.
-    if opt.jobs is None:
-      # User has not made a choice, so use the manifest settings.
-      opt.jobs = mp.default.sync_j
-    if opt.jobs is not None:
-      # Neither user nor manifest have made a choice.
-      if opt.jobs_network is None:
-        opt.jobs_network = opt.jobs
-      if opt.jobs_checkout is None:
-        opt.jobs_checkout = opt.jobs
-    # Setup defaults if jobs==0.
-    if not opt.jobs:
-      if not opt.jobs_network:
-        opt.jobs_network = 1
-      if not opt.jobs_checkout:
-        opt.jobs_checkout = DEFAULT_LOCAL_JOBS
-      opt.jobs = os.cpu_count()
-
-    # Try to stay under user rlimit settings.
-    #
-    # Since each worker requires at 3 file descriptors to run `git fetch`, use
-    # that to scale down the number of jobs.  Unfortunately there isn't an easy
-    # way to determine this reliably as systems change, but it was last measured
-    # by hand in 2011.
-    soft_limit, _ = _rlimit_nofile()
-    jobs_soft_limit = max(1, (soft_limit - 5) // 3)
-    opt.jobs = min(opt.jobs, jobs_soft_limit)
-    opt.jobs_network = min(opt.jobs_network, jobs_soft_limit)
-    opt.jobs_checkout = min(opt.jobs_checkout, jobs_soft_limit)
+    # Now that the manifests are up-to-date, setup options whose defaults might
+    # be in the manifest.
+    self._ValidateOptionsWithManifest(opt, mp)
 
     superproject_logging_data = {}
     self._UpdateProjectsRevisionId(opt, args, superproject_logging_data,

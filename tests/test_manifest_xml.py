@@ -117,7 +117,7 @@ class ManifestParseTestCase(unittest.TestCase):
 
   def getXmlManifest(self, data):
     """Helper to initialize a manifest for testing."""
-    with open(self.manifest_file, 'w') as fp:
+    with open(self.manifest_file, 'w', encoding="utf-8") as fp:
       fp.write(data)
     return manifest_xml.XmlManifest(self.repodir, self.manifest_file)
 
@@ -428,7 +428,7 @@ class IncludeElementTests(ManifestParseTestCase):
     def parse(name):
       name = self.encodeXmlAttr(name)
       # Setup target of the include.
-      with open(os.path.join(self.manifest_dir, 'target.xml'), 'w') as fp:
+      with open(os.path.join(self.manifest_dir, 'target.xml'), 'w', encoding="utf-8") as fp:
         fp.write(f'<manifest><include name="{name}"/></manifest>')
 
       manifest = self.getXmlManifest("""
@@ -519,22 +519,22 @@ class ProjectElementTests(ManifestParseTestCase):
 """)
 
     manifest = parse('a/path/', 'foo')
-    self.assertEqual(manifest.projects[0].gitdir,
-                     os.path.join(self.tempdir, '.repo/projects/foo.git'))
-    self.assertEqual(manifest.projects[0].objdir,
-                     os.path.join(self.tempdir, '.repo/project-objects/a/path.git'))
+    self.assertEqual(os.path.normpath(manifest.projects[0].gitdir),
+                     os.path.join(self.tempdir, '.repo', 'projects', 'foo.git'))
+    self.assertEqual(os.path.normpath(manifest.projects[0].objdir),
+                     os.path.join(self.tempdir, '.repo', 'project-objects', 'a', 'path.git'))
 
     manifest = parse('a/path', 'foo/')
-    self.assertEqual(manifest.projects[0].gitdir,
-                     os.path.join(self.tempdir, '.repo/projects/foo.git'))
-    self.assertEqual(manifest.projects[0].objdir,
-                     os.path.join(self.tempdir, '.repo/project-objects/a/path.git'))
+    self.assertEqual(os.path.normpath(manifest.projects[0].gitdir),
+                     os.path.join(self.tempdir, '.repo', 'projects', 'foo.git'))
+    self.assertEqual(os.path.normpath(manifest.projects[0].objdir),
+                     os.path.join(self.tempdir, '.repo', 'project-objects', 'a', 'path.git'))
 
     manifest = parse('a/path', 'foo//////')
-    self.assertEqual(manifest.projects[0].gitdir,
-                     os.path.join(self.tempdir, '.repo/projects/foo.git'))
-    self.assertEqual(manifest.projects[0].objdir,
-                     os.path.join(self.tempdir, '.repo/project-objects/a/path.git'))
+    self.assertEqual(os.path.normpath(manifest.projects[0].gitdir),
+                     os.path.join(self.tempdir, '.repo', 'projects', 'foo.git'))
+    self.assertEqual(os.path.normpath(manifest.projects[0].objdir),
+                     os.path.join(self.tempdir, '.repo', 'project-objects', 'a', 'path.git'))
 
   def test_toplevel_path(self):
     """Check handling of path=. specially."""
@@ -551,8 +551,8 @@ class ProjectElementTests(ManifestParseTestCase):
 
     for path in ('.', './', './/', './//'):
       manifest = parse('server/path', path)
-      self.assertEqual(manifest.projects[0].gitdir,
-                       os.path.join(self.tempdir, '.repo/projects/..git'))
+      self.assertEqual(os.path.normpath(manifest.projects[0].gitdir),
+                       os.path.join(self.tempdir, '.repo', 'projects', '..git'))
 
   def test_bad_path_name_checks(self):
     """Check handling of bad path & name attributes."""
@@ -578,7 +578,7 @@ class ProjectElementTests(ManifestParseTestCase):
       parse('', 'ok')
 
     for path in INVALID_FS_PATHS:
-      if not path or path.endswith('/'):
+      if not path or path.endswith('/') or path.endswith(os.path.sep):
         continue
 
       with self.assertRaises(error.ManifestInvalidPathError):
