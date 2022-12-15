@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-# Copyright (C) 2021 The Android Open Source Project
+# Copyright 2022 The Android Open Source Project
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -13,13 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Helper tool for generating manual page for all repo commands.
+"""Common fixtures for pytests."""
 
-This is intended to be run before every official Repo release.
-"""
+import pytest
 
-import sys
+import repo_trace
 
-import update_manpages
 
-sys.exit(update_manpages.main(sys.argv[1:]))
+@pytest.fixture(autouse=True)
+def disable_repo_trace(tmp_path):
+  """Set an environment marker to relax certain strict checks for test code."""
+  repo_trace._TRACE_FILE = str(tmp_path / 'TRACE_FILE_from_test')

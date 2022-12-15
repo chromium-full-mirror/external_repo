@@ -15,12 +15,10 @@
 
 """Wrapper to run pytest with the right settings."""
 
-import errno
 import os
 import shutil
 import subprocess
 import sys
-import repo_trace
 
 
 def find_pytest():

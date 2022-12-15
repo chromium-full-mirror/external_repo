@@ -24,7 +24,6 @@ from unittest import mock
 import git_superproject
 import git_trace2_event_log
 import manifest_xml
-import repo_trace
 from test_manifest_xml import sort_attributes
 
 
@@ -40,7 +39,6 @@ class SuperprojectTestCase(unittest.TestCase):
     """Set up superproject every time."""
     self.tempdirobj = tempfile.TemporaryDirectory(prefix='repo_tests')
     self.tempdir = self.tempdirobj.name
-    repo_trace._TRACE_FILE = os.path.join(self.tempdir, 'TRACE_FILE_from_test')
     self.repodir = os.path.join(self.tempdir, '.repo')
     self.manifest_file = os.path.join(
         self.repodir, manifest_xml.MANIFEST_FILE_NAME)
@@ -366,3 +364,41 @@ class SuperprojectTestCase(unittest.TestCase):
               'revision="52d3c9f7c107839ece2319d077de0cd922aa9d8f"/>'
               '<superproject name="superproject"/>'
               '</manifest>')
+
+  def test_Fetch(self):
+    manifest = self.getXmlManifest("""
+<manifest>
+  <remote name="default-remote" fetch="http://localhost" />
+  <default remote="default-remote" revision="refs/heads/main" />
+  <superproject name="superproject"/>
+  " /></manifest>
+""")
+    self.maxDiff = None
+    self._superproject = git_superproject.Superproject(
+        manifest, name='superproject',
+        remote=manifest.remotes.get('default-remote').ToRemoteSpec('superproject'),
+        revision='refs/heads/main')
+    os.mkdir(self._superproject._superproject_path)
+    os.mkdir(self._superproject._work_git)
+    with mock.patch.object(self._superproject, '_Init', return_value=True):
+      with mock.patch('git_superproject.GitCommand', autospec=True) as mock_git_command:
+        with mock.patch('git_superproject.GitRefs.get', autospec=True) as mock_git_refs:
+          instance = mock_git_command.return_value
+          instance.Wait.return_value = 0
+          mock_git_refs.side_effect = ['', '1234']
+
+          self.assertTrue(self._superproject._Fetch())
+          self.assertEqual(mock_git_command.call_args.args,(None, [
+              'fetch', 'http://localhost/superproject', '--depth', '1',
+              '--force', '--no-tags', '--filter', 'blob:none',
+              'refs/heads/main:refs/heads/main'
+          ]))
+
+          # If branch for revision exists, set as --negotiation-tip.
+          self.assertTrue(self._superproject._Fetch())
+          self.assertEqual(mock_git_command.call_args.args,(None, [
+              'fetch', 'http://localhost/superproject', '--depth', '1',
+              '--force', '--no-tags', '--filter', 'blob:none',
+              '--negotiation-tip', '1234',
+              'refs/heads/main:refs/heads/main'
+          ]))
