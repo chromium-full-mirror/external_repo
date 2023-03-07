@@ -504,6 +504,8 @@ later is required to fix a server side protocol bug.
         print('error: Cannot fetch %s from %s'
               % (project.name, project.remote.url),
               file=sys.stderr)
+    except KeyboardInterrupt:
+      print(f'Keyboard interrupt while processing {project.name}')
     except GitError as e:
       print('error.GitError: Cannot fetch %s' % str(e), file=sys.stderr)
     except Exception as e:
@@ -550,7 +552,7 @@ later is required to fix a server side protocol bug.
             ret = False
           else:
             fetched.add(project.gitdir)
-          pm.update(msg=project.name)
+          pm.update(msg=f'Last synced: {project.name}')
         if not ret and opt.fail_fast:
           break
       return ret
@@ -778,7 +780,7 @@ later is required to fix a server side protocol bug.
       # We do not support switching between the options.  The environment
       # variable is present for testing and migration only.
       return not project.UseAlternates
-    print(f'\r{relpath}: project not found in manifest.', file=sys.stderr)
+
     return False
 
   def _SetPreciousObjectsState(self, project: Project, opt):
