@@ -66,7 +66,7 @@ from command import (
 from error import RepoChangedException, GitError
 import platform_utils
 from project import SyncBuffer
-from progress import Progress
+from progress import Progress, elapsed_str, jobs_str
 from repo_trace import Trace
 import ssh
 from wrapper import Wrapper
@@ -78,6 +78,8 @@ _ONE_DAY_S = 24 * 60 * 60
 # revert a change in default behavior in v2.29.9.  Remove after 2023-04-01.
 _REPO_AUTO_GC = "REPO_AUTO_GC"
 _AUTO_GC = os.environ.get(_REPO_AUTO_GC) == "1"
+
+_REPO_ALLOW_SHALLOW = os.environ.get("REPO_ALLOW_SHALLOW")
 
 
 class _FetchOneResult(NamedTuple):
@@ -605,7 +607,7 @@ later is required to fix a server side protocol bug.
         The projects we're given share the same underlying git object store, so
         we have to fetch them in serial.
 
-        Delegates most of the work to _FetchHelper.
+        Delegates most of the work to _FetchOne.
 
         Args:
             opt: Program options returned from optparse.  See _Options().
@@ -624,6 +626,8 @@ later is required to fix a server side protocol bug.
             Whether the fetch was successful.
         """
         start = time.time()
+        k = f"{project.name} @ {project.relpath}"
+        self._sync_dict[k] = start
         success = False
         remote_fetched = False
         buf = io.StringIO()
@@ -646,6 +650,7 @@ later is required to fix a server side protocol bug.
                 ssh_proxy=self.ssh_proxy,
                 clone_filter=project.manifest.CloneFilter,
                 partial_clone_exclude=project.manifest.PartialCloneExclude,
+                clone_filter_for_depth=project.manifest.CloneFilterForDepth,
             )
             success = sync_result.success
             remote_fetched = sync_result.remote_fetched
@@ -670,14 +675,35 @@ later is required to fix a server side protocol bug.
                 % (project.name, type(e).__name__, str(e)),
                 file=sys.stderr,
             )
+            del self._sync_dict[k]
             raise
 
         finish = time.time()
+        del self._sync_dict[k]
         return _FetchOneResult(success, project, start, finish, remote_fetched)
 
     @classmethod
     def _FetchInitChild(cls, ssh_proxy):
         cls.ssh_proxy = ssh_proxy
+
+    def _GetSyncProgressMessage(self):
+        earliest_time = float("inf")
+        earliest_proj = None
+        items = self._sync_dict.items()
+        for project, t in items:
+            if t < earliest_time:
+                earliest_time = t
+                earliest_proj = project
+
+        if not earliest_proj:
+            # This function is called when sync is still running but in some
+            # cases (by chance), _sync_dict can contain no entries. Return some
+            # text to indicate that sync is still working.
+            return "..working.."
+
+        elapsed = time.time() - earliest_time
+        jobs = jobs_str(len(items))
+        return f"{jobs} | {elapsed_str(elapsed)} {earliest_proj}"
 
     def _Fetch(self, projects, opt, err_event, ssh_proxy):
         ret = True
@@ -691,7 +717,21 @@ later is required to fix a server side protocol bug.
             delay=False,
             quiet=opt.quiet,
             show_elapsed=True,
+            elide=True,
         )
+
+        self._sync_dict = multiprocessing.Manager().dict()
+        sync_event = _threading.Event()
+
+        def _MonitorSyncLoop():
+            while True:
+                pm.update(inc=0, msg=self._GetSyncProgressMessage())
+                if sync_event.wait(timeout=1):
+                    return
+
+        sync_progress_thread = _threading.Thread(target=_MonitorSyncLoop)
+        sync_progress_thread.daemon = True
+        sync_progress_thread.start()
 
         objdir_project_map = dict()
         for project in projects:
@@ -722,7 +762,7 @@ later is required to fix a server side protocol bug.
                         ret = False
                     else:
                         fetched.add(project.gitdir)
-                    pm.update(msg=f"Last synced: {project.name}")
+                    pm.update()
                 if not ret and opt.fail_fast:
                     break
             return ret
@@ -774,6 +814,7 @@ later is required to fix a server side protocol bug.
         # crash.
         del Sync.ssh_proxy
 
+        sync_event.set()
         pm.end()
         self._fetch_times.Save()
 
@@ -1417,6 +1458,7 @@ later is required to fix a server side protocol bug.
                 cache_dir=opt.cache_dir,
                 clone_filter=mp.manifest.CloneFilter,
                 partial_clone_exclude=mp.manifest.PartialCloneExclude,
+                clone_filter_for_depth=mp.manifest.CloneFilterForDepth,
             )
             finish = time.time()
             self.event_log.AddSync(
@@ -1584,6 +1626,15 @@ later is required to fix a server side protocol bug.
             _PostRepoUpgrade(manifest, quiet=opt.quiet)
 
         mp = manifest.manifestProject
+
+        if _REPO_ALLOW_SHALLOW is not None:
+            if _REPO_ALLOW_SHALLOW == "1":
+                mp.ConfigureCloneFilterForDepth(None)
+            elif (
+                _REPO_ALLOW_SHALLOW == "0" and mp.clone_filter_for_depth is None
+            ):
+                mp.ConfigureCloneFilterForDepth("blob:none")
+
         if opt.mp_update:
             self._UpdateAllManifestProjects(opt, mp, manifest_name)
         else:
@@ -1724,32 +1775,29 @@ later is required to fix a server side protocol bug.
 
         # If we saw an error, exit with code 1 so that other scripts can check.
         if err_event.is_set():
-            print("\nerror: Unable to fully sync the tree.", file=sys.stderr)
+            # Add a new line so it's easier to read.
+            print("\n", file=sys.stderr)
+
+            def print_and_log(err_msg):
+                self.git_event_log.ErrorEvent(err_msg)
+                print(err_msg, file=sys.stderr)
+
+            print_and_log("error: Unable to fully sync the tree")
             if err_network_sync:
-                print(
-                    "error: Downloading network changes failed.",
-                    file=sys.stderr,
-                )
+                print_and_log("error: Downloading network changes failed.")
             if err_update_projects:
-                print(
-                    "error: Updating local project lists failed.",
-                    file=sys.stderr,
-                )
+                print_and_log("error: Updating local project lists failed.")
             if err_update_linkfiles:
-                print(
-                    "error: Updating copyfiles or linkfiles failed.",
-                    file=sys.stderr,
-                )
+                print_and_log("error: Updating copyfiles or linkfiles failed.")
             if err_checkout:
-                print(
-                    "error: Checking out local projects failed.",
-                    file=sys.stderr,
-                )
+                print_and_log("error: Checking out local projects failed.")
                 if err_results:
+                    # Don't log repositories, as it may contain sensitive info.
                     print(
                         "Failing repos:\n%s" % "\n".join(err_results),
                         file=sys.stderr,
                     )
+            # Not useful to log.
             print(
                 'Try re-running with "-j1 --fail-fast" to exit at the first '
                 "error.",

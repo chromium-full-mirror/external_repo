@@ -142,14 +142,14 @@ revision specified in the manifest.
                     sync_buf = SyncBuffer(self.manifest.manifestProject.config)
                     project.Sync_LocalHalf(sync_buf)
                     project.revisionId = gitc_project.old_revision
-                pm.update()
+                pm.update(msg="")
             pm.end()
 
         def _ProcessResults(_pool, pm, results):
             for result, project in results:
                 if not result:
                     err.append(project)
-                pm.update()
+                pm.update(msg="")
 
         self.ExecuteInParallel(
             opt.jobs,
@@ -168,4 +168,6 @@ revision specified in the manifest.
                     % (p.RelPath(local=opt.this_manifest_only), nb),
                     file=sys.stderr,
                 )
+            msg_fmt = "cannot start %d project(s)"
+            self.git_event_log.ErrorEvent(msg_fmt % (len(err)), msg_fmt)
             sys.exit(1)
