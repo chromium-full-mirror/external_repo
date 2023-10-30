@@ -16,12 +16,14 @@ import os
 import sys
 import time
 
+
 try:
     import threading as _threading
 except ImportError:
     import dummy_threading as _threading
 
 from repo_trace import IsTraceToStderr
+
 
 _TTY = sys.stderr.isatty()
 
@@ -80,7 +82,7 @@ def jobs_str(total):
     return f"{total} job{'s' if total > 1 else ''}"
 
 
-class Progress(object):
+class Progress:
     def __init__(
         self,
         title,

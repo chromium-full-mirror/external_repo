@@ -90,7 +90,9 @@ class EventLogTestCase(unittest.TestCase):
             self.assertRegex(log_entry["sid"], self.FULL_SID_REGEX)
         else:
             self.assertRegex(log_entry["sid"], self.SELF_SID_REGEX)
-        self.assertRegex(log_entry["time"], r"^\d+-\d+-\d+T\d+:\d+:\d+\.\d+Z$")
+        self.assertRegex(
+            log_entry["time"], r"^\d+-\d+-\d+T\d+:\d+:\d+\.\d+\+00:00$"
+        )
 
     def readLog(self, log_path):
         """Helper function to read log data into a list."""
@@ -338,8 +340,8 @@ class EventLogTestCase(unittest.TestCase):
         # Check for 'error' event specific fields.
         self.assertIn("msg", error_event)
         self.assertIn("fmt", error_event)
-        self.assertEqual(error_event["msg"], msg)
-        self.assertEqual(error_event["fmt"], fmt)
+        self.assertEqual(error_event["msg"], f"RepoErrorEvent:{msg}")
+        self.assertEqual(error_event["fmt"], f"RepoErrorEvent:{fmt}")
 
     def test_write_with_filename(self):
         """Test Write() with a path to a file exits with None."""

@@ -14,10 +14,15 @@
 
 import re
 import sys
+
 from command import Command
+from error import GitError
 from git_command import GitCommand
+from repo_logging import RepoLogger
+
 
 CHANGE_ID_RE = re.compile(r"^\s*Change-Id: I([0-9a-f]{40})\s*$")
+logger = RepoLogger(__file__)
 
 
 class CherryPick(Command):
@@ -44,18 +49,29 @@ change id will be added.
             ["rev-parse", "--verify", reference],
             capture_stdout=True,
             capture_stderr=True,
+            verify_command=True,
         )
-        if p.Wait() != 0:
-            print(p.stderr, file=sys.stderr)
-            sys.exit(1)
+        try:
+            p.Wait()
+        except GitError:
+            logger.error(p.stderr)
+            raise
+
         sha1 = p.stdout.strip()
 
-        p = GitCommand(None, ["cat-file", "commit", sha1], capture_stdout=True)
-        if p.Wait() != 0:
-            print(
-                "error: Failed to retrieve old commit message", file=sys.stderr
-            )
-            sys.exit(1)
+        p = GitCommand(
+            None,
+            ["cat-file", "commit", sha1],
+            capture_stdout=True,
+            verify_command=True,
+        )
+
+        try:
+            p.Wait()
+        except GitError:
+            logger.error("error: Failed to retrieve old commit message")
+            raise
+
         old_msg = self._StripHeader(p.stdout)
 
         p = GitCommand(
@@ -63,37 +79,43 @@ change id will be added.
             ["cherry-pick", sha1],
             capture_stdout=True,
             capture_stderr=True,
+            verify_command=True,
         )
-        status = p.Wait()
+
+        try:
+            p.Wait()
+        except GitError as e:
+            logger.error(e)
+            logger.warning(
+                "NOTE: When committing (please see above) and editing the "
+                "commit message, please remove the old Change-Id-line and "
+                "add:\n%s",
+                self._GetReference(sha1),
+            )
+            raise
 
         if p.stdout:
             print(p.stdout.strip(), file=sys.stdout)
         if p.stderr:
             print(p.stderr.strip(), file=sys.stderr)
 
-        if status == 0:
-            # The cherry-pick was applied correctly. We just need to edit the
-            # commit message.
-            new_msg = self._Reformat(old_msg, sha1)
+        # The cherry-pick was applied correctly. We just need to edit
+        # the commit message.
+        new_msg = self._Reformat(old_msg, sha1)
 
-            p = GitCommand(
-                None,
-                ["commit", "--amend", "-F", "-"],
-                input=new_msg,
-                capture_stdout=True,
-                capture_stderr=True,
-            )
-            if p.Wait() != 0:
-                print("error: Failed to update commit message", file=sys.stderr)
-                sys.exit(1)
-
-        else:
-            print(
-                "NOTE: When committing (please see above) and editing the "
-                "commit message, please remove the old Change-Id-line and add:"
-            )
-            print(self._GetReference(sha1), file=sys.stderr)
-            print(file=sys.stderr)
+        p = GitCommand(
+            None,
+            ["commit", "--amend", "-F", "-"],
+            input=new_msg,
+            capture_stdout=True,
+            capture_stderr=True,
+            verify_command=True,
+        )
+        try:
+            p.Wait()
+        except GitError:
+            logger.error("error: Failed to update commit message")
+            raise
 
     def _IsChangeId(self, line):
         return CHANGE_ID_RE.match(line)

@@ -22,16 +22,18 @@ Examples:
   UpdateProjectsResult = superproject.UpdateProjectsRevisionId(projects)
 """
 
-import hashlib
 import functools
+import hashlib
 import os
 import sys
 import time
 from typing import NamedTuple
 
-from git_command import git_require, GitCommand
+from git_command import git_require
+from git_command import GitCommand
 from git_config import RepoConfig
 from git_refs import GitRefs
+
 
 _SUPERPROJECT_GIT_NAME = "superproject.git"
 _SUPERPROJECT_MANIFEST_NAME = "superproject_override.xml"
@@ -64,7 +66,7 @@ class UpdateProjectsResult(NamedTuple):
     fatal: bool
 
 
-class Superproject(object):
+class Superproject:
     """Get commit ids from superproject.
 
     Initializes a local copy of a superproject for the manifest. This allows
@@ -379,7 +381,7 @@ class Superproject(object):
         try:
             with open(manifest_path, "w", encoding="utf-8") as fp:
                 fp.write(manifest_str)
-        except IOError as e:
+        except OSError as e:
             self._LogError("cannot write manifest to : {} {}", manifest_path, e)
             return None
         return manifest_path

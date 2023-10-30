@@ -12,14 +12,24 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from collections import defaultdict
+import collections
 import functools
 import itertools
-import sys
 
-from command import Command, DEFAULT_LOCAL_JOBS
+from command import Command
+from command import DEFAULT_LOCAL_JOBS
+from error import RepoError
+from error import RepoExitError
 from git_command import git
 from progress import Progress
+from repo_logging import RepoLogger
+
+
+logger = RepoLogger(__file__)
+
+
+class AbandonError(RepoExitError):
+    """Exit error when abandon command fails."""
 
 
 class Abandon(Command):
@@ -68,28 +78,37 @@ It is equivalent to "git branch -D <branchname>".
             branches = nb
 
         ret = {}
+        errors = []
         for name in branches:
-            status = project.AbandonBranch(name)
+            status = None
+            try:
+                status = project.AbandonBranch(name)
+            except RepoError as e:
+                status = False
+                errors.append(e)
             if status is not None:
                 ret[name] = status
-        return (ret, project)
+
+        return (ret, project, errors)
 
     def Execute(self, opt, args):
         nb = args[0].split()
-        err = defaultdict(list)
-        success = defaultdict(list)
+        err = collections.defaultdict(list)
+        success = collections.defaultdict(list)
+        aggregate_errors = []
         all_projects = self.GetProjects(
             args[1:], all_manifests=not opt.this_manifest_only
         )
         _RelPath = lambda p: p.RelPath(local=opt.this_manifest_only)
 
         def _ProcessResults(_pool, pm, states):
-            for results, project in states:
+            for results, project, errors in states:
                 for branch, status in results.items():
                     if status:
                         success[branch].append(project)
                     else:
                         err[branch].append(project)
+                aggregate_errors.extend(errors)
                 pm.update(msg="")
 
         self.ExecuteInParallel(
@@ -110,19 +129,13 @@ It is equivalent to "git branch -D <branchname>".
         if err:
             for br in err.keys():
                 err_msg = "error: cannot abandon %s" % br
-                print(err_msg, file=sys.stderr)
+                logger.error(err_msg)
                 for proj in err[br]:
-                    print(
-                        " " * len(err_msg) + " | %s" % _RelPath(proj),
-                        file=sys.stderr,
-                    )
-            sys.exit(1)
+                    logger.error(" " * len(err_msg) + " | %s", _RelPath(proj))
+            raise AbandonError(aggregate_errors=aggregate_errors)
         elif not success:
-            print(
-                "error: no project has local branch(es) : %s" % nb,
-                file=sys.stderr,
-            )
-            sys.exit(1)
+            logger.error("error: no project has local branch(es) : %s", nb)
+            raise AbandonError(aggregate_errors=aggregate_errors)
         else:
             # Everything below here is displaying status.
             if opt.quiet:

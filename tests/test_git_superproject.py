@@ -21,10 +21,11 @@ import tempfile
 import unittest
 from unittest import mock
 
+from test_manifest_xml import sort_attributes
+
 import git_superproject
 import git_trace2_event_log
 import manifest_xml
-from test_manifest_xml import sort_attributes
 
 
 class SuperprojectTestCase(unittest.TestCase):
@@ -107,7 +108,9 @@ class SuperprojectTestCase(unittest.TestCase):
             self.assertRegex(log_entry["sid"], self.FULL_SID_REGEX)
         else:
             self.assertRegex(log_entry["sid"], self.SELF_SID_REGEX)
-        self.assertRegex(log_entry["time"], r"^\d+-\d+-\d+T\d+:\d+:\d+\.\d+Z$")
+        self.assertRegex(
+            log_entry["time"], r"^\d+-\d+-\d+T\d+:\d+:\d+\.\d+\+00:00$"
+        )
 
     def readLog(self, log_path):
         """Helper function to read log data into a list."""
@@ -246,7 +249,7 @@ class SuperprojectTestCase(unittest.TestCase):
         os.mkdir(self._superproject._superproject_path)
         manifest_path = self._superproject._WriteManifestFile()
         self.assertIsNotNone(manifest_path)
-        with open(manifest_path, "r") as fp:
+        with open(manifest_path) as fp:
             manifest_xml_data = fp.read()
         self.assertEqual(
             sort_attributes(manifest_xml_data),
@@ -281,7 +284,7 @@ class SuperprojectTestCase(unittest.TestCase):
                     )
                     self.assertIsNotNone(update_result.manifest_path)
                     self.assertFalse(update_result.fatal)
-                    with open(update_result.manifest_path, "r") as fp:
+                    with open(update_result.manifest_path) as fp:
                         manifest_xml_data = fp.read()
                     self.assertEqual(
                         sort_attributes(manifest_xml_data),
@@ -368,7 +371,7 @@ class SuperprojectTestCase(unittest.TestCase):
                     )
                     self.assertIsNotNone(update_result.manifest_path)
                     self.assertFalse(update_result.fatal)
-                    with open(update_result.manifest_path, "r") as fp:
+                    with open(update_result.manifest_path) as fp:
                         manifest_xml_data = fp.read()
                     # Verify platform/vendor/x's project revision hasn't
                     # changed.
@@ -433,7 +436,7 @@ class SuperprojectTestCase(unittest.TestCase):
                     )
                     self.assertIsNotNone(update_result.manifest_path)
                     self.assertFalse(update_result.fatal)
-                    with open(update_result.manifest_path, "r") as fp:
+                    with open(update_result.manifest_path) as fp:
                         manifest_xml_data = fp.read()
                     # Verify platform/vendor/x's project revision hasn't
                     # changed.
@@ -489,7 +492,9 @@ class SuperprojectTestCase(unittest.TestCase):
 
                     self.assertTrue(self._superproject._Fetch())
                     self.assertEqual(
-                        mock_git_command.call_args.args,
+                        # TODO: Once we require Python 3.8+,
+                        #  use 'mock_git_command.call_args.args'.
+                        mock_git_command.call_args[0],
                         (
                             None,
                             [
@@ -509,7 +514,9 @@ class SuperprojectTestCase(unittest.TestCase):
                     # If branch for revision exists, set as --negotiation-tip.
                     self.assertTrue(self._superproject._Fetch())
                     self.assertEqual(
-                        mock_git_command.call_args.args,
+                        # TODO: Once we require Python 3.8+,
+                        #  use 'mock_git_command.call_args.args'.
+                        mock_git_command.call_args[0],
                         (
                             None,
                             [

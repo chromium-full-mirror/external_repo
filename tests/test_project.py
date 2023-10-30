@@ -22,9 +22,9 @@ import tempfile
 import unittest
 
 import error
-import manifest_xml
 import git_command
 import git_config
+import manifest_xml
 import platform_utils
 import project
 
@@ -48,7 +48,7 @@ def TempGitTree():
         yield tempdir
 
 
-class FakeProject(object):
+class FakeProject:
     """A fake for Project for basic functionality."""
 
     def __init__(self, worktree):
@@ -507,7 +507,10 @@ class ManifestPropertiesFetchedCorrectly(unittest.TestCase):
             self.assertFalse(fakeproj.partial_clone)
 
             fakeproj.config.SetString("repo.depth", "48")
-            self.assertEqual(fakeproj.depth, "48")
+            self.assertEqual(fakeproj.depth, 48)
+
+            fakeproj.config.SetString("repo.depth", "invalid_depth")
+            self.assertEqual(fakeproj.depth, None)
 
             fakeproj.config.SetString("repo.clonefilter", "blob:limit=10M")
             self.assertEqual(fakeproj.clone_filter, "blob:limit=10M")

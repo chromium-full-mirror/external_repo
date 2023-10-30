@@ -21,6 +21,7 @@ which takes care of execing this entry point.
 """
 
 import getpass
+import json
 import netrc
 import optparse
 import os
@@ -31,35 +32,46 @@ import textwrap
 import time
 import urllib.request
 
+from repo_logging import RepoLogger
+
+
 try:
     import kerberos
 except ImportError:
     kerberos = None
 
 from color import SetDefaultColoring
-import event_log
-from repo_trace import SetTrace, Trace, SetTraceToStderr
-from git_command import user_agent
-from git_config import RepoConfig
-from git_trace2_event_log import EventLog
 from command import InteractiveCommand
 from command import MirrorSafeCommand
-from command import GitcAvailableCommand, GitcClientCommand
-from subcmds.version import Version
 from editor import Editor
 from error import DownloadError
+from error import GitcUnsupportedError
 from error import InvalidProjectGroupsError
 from error import ManifestInvalidRevisionError
-from error import ManifestParseError
 from error import NoManifestException
 from error import NoSuchProjectError
 from error import RepoChangedException
-import gitc_utils
-from manifest_xml import GitcClient, RepoClient
-from pager import RunPager, TerminatePager
-from wrapper import WrapperPath, Wrapper
-
+from error import RepoError
+from error import RepoExitError
+from error import RepoUnhandledExceptionError
+from error import SilentRepoExitError
+import event_log
+from git_command import user_agent
+from git_config import RepoConfig
+from git_trace2_event_log import EventLog
+from manifest_xml import RepoClient
+from pager import RunPager
+from pager import TerminatePager
+from repo_trace import SetTrace
+from repo_trace import SetTraceToStderr
+from repo_trace import Trace
 from subcmds import all_commands
+from subcmds.version import Version
+from wrapper import Wrapper
+from wrapper import WrapperPath
+
+
+logger = RepoLogger(__file__)
 
 
 # NB: These do not need to be kept in sync with the repo launcher script.
@@ -74,29 +86,22 @@ from subcmds import all_commands
 MIN_PYTHON_VERSION_SOFT = (3, 6)
 MIN_PYTHON_VERSION_HARD = (3, 6)
 
-if sys.version_info.major < 3:
-    print(
-        "repo: error: Python 2 is no longer supported; "
-        "Please upgrade to Python {}.{}+.".format(*MIN_PYTHON_VERSION_SOFT),
-        file=sys.stderr,
+if sys.version_info < MIN_PYTHON_VERSION_HARD:
+    logger.error(
+        "repo: error: Python version is too old; "
+        "Please upgrade to Python %d.%d+.",
+        *MIN_PYTHON_VERSION_SOFT,
     )
     sys.exit(1)
-else:
-    if sys.version_info < MIN_PYTHON_VERSION_HARD:
-        print(
-            "repo: error: Python 3 version is too old; "
-            "Please upgrade to Python {}.{}+.".format(*MIN_PYTHON_VERSION_SOFT),
-            file=sys.stderr,
-        )
-        sys.exit(1)
-    elif sys.version_info < MIN_PYTHON_VERSION_SOFT:
-        print(
-            "repo: warning: your Python 3 version is no longer supported; "
-            "Please upgrade to Python {}.{}+.".format(*MIN_PYTHON_VERSION_SOFT),
-            file=sys.stderr,
-        )
+elif sys.version_info < MIN_PYTHON_VERSION_SOFT:
+    logger.error(
+        "repo: warning: your Python version is no longer supported; "
+        "Please upgrade to Python %d.%d+.",
+        *MIN_PYTHON_VERSION_SOFT,
+    )
 
 KEYBOARD_INTERRUPT_EXIT = 128 + signal.SIGINT
+MAX_PRINT_ERRORS = 5
 
 global_options = optparse.OptionParser(
     usage="repo [-p|--paginate|--no-pager] COMMAND [ARGS]",
@@ -181,7 +186,7 @@ global_options.add_option(
 )
 
 
-class _Repo(object):
+class _Repo:
     def __init__(self, repodir):
         self.repodir = repodir
         self.commands = all_commands
@@ -299,11 +304,10 @@ class _Repo(object):
                 submanifest_path=gopts.submanifest_path,
                 outer_client=outer_client,
             )
-        gitc_manifest = None
-        gitc_client_name = gitc_utils.parse_clientdir(os.getcwd())
-        if gitc_client_name:
-            gitc_manifest = GitcClient(self.repodir, gitc_client_name)
-            repo_client.isGitcClient = True
+
+        if Wrapper().gitc_parse_clientdir(os.getcwd()):
+            logger.error("GITC is not supported.")
+            raise GitcUnsupportedError()
 
         try:
             cmd = self.commands[name](
@@ -312,50 +316,27 @@ class _Repo(object):
                 manifest=repo_client.manifest,
                 outer_client=outer_client,
                 outer_manifest=outer_client.manifest,
-                gitc_manifest=gitc_manifest,
                 git_event_log=git_trace2_event_log,
             )
         except KeyError:
-            print(
-                "repo: '%s' is not a repo command.  See 'repo help'." % name,
-                file=sys.stderr,
+            logger.error(
+                "repo: '%s' is not a repo command.  See 'repo help'.", name
             )
             return 1
 
         Editor.globalConfig = cmd.client.globalConfig
 
         if not isinstance(cmd, MirrorSafeCommand) and cmd.manifest.IsMirror:
-            print(
-                "fatal: '%s' requires a working directory" % name,
-                file=sys.stderr,
-            )
-            return 1
-
-        if (
-            isinstance(cmd, GitcAvailableCommand)
-            and not gitc_utils.get_gitc_manifest_dir()
-        ):
-            print(
-                "fatal: '%s' requires GITC to be available" % name,
-                file=sys.stderr,
-            )
-            return 1
-
-        if isinstance(cmd, GitcClientCommand) and not gitc_client_name:
-            print("fatal: '%s' requires a GITC client" % name, file=sys.stderr)
+            logger.error("fatal: '%s' requires a working directory", name)
             return 1
 
         try:
             copts, cargs = cmd.OptionParser.parse_args(argv)
             copts = cmd.ReadEnvironmentOptions(copts)
         except NoManifestException as e:
-            print(
-                "error: in `%s`: %s" % (" ".join([name] + argv), str(e)),
-                file=sys.stderr,
-            )
-            print(
-                "error: manifest missing or unreadable -- please run init",
-                file=sys.stderr,
+            logger.error("error: in `%s`: %s", " ".join([name] + argv), e)
+            logger.error(
+                "error: manifest missing or unreadable -- please run init"
             )
             return 1
 
@@ -422,12 +403,36 @@ class _Repo(object):
             """
             try:
                 execute_command_helper()
-            except (KeyboardInterrupt, SystemExit, Exception) as e:
+            except (
+                KeyboardInterrupt,
+                SystemExit,
+                Exception,
+                RepoExitError,
+            ) as e:
                 ok = isinstance(e, SystemExit) and not e.code
+                exception_name = type(e).__name__
+                if isinstance(e, RepoUnhandledExceptionError):
+                    exception_name = type(e.error).__name__
+                if isinstance(e, RepoExitError):
+                    aggregated_errors = e.aggregate_errors or []
+                    for error in aggregated_errors:
+                        project = None
+                        if isinstance(error, RepoError):
+                            project = error.project
+                        error_info = json.dumps(
+                            {
+                                "ErrorType": type(error).__name__,
+                                "Project": project,
+                                "Message": str(error),
+                            }
+                        )
+                        git_trace2_event_log.ErrorEvent(
+                            f"AggregateExitError:{error_info}"
+                        )
                 if not ok:
-                    exception_name = type(e).__name__
                     git_trace2_event_log.ErrorEvent(
-                        f"RepoExitError:{exception_name}")
+                        f"RepoExitError:{exception_name}"
+                    )
                 raise
 
         try:
@@ -437,42 +442,39 @@ class _Repo(object):
             ManifestInvalidRevisionError,
             NoManifestException,
         ) as e:
-            print(
-                "error: in `%s`: %s" % (" ".join([name] + argv), str(e)),
-                file=sys.stderr,
-            )
+            logger.error("error: in `%s`: %s", " ".join([name] + argv), e)
             if isinstance(e, NoManifestException):
-                print(
-                    "error: manifest missing or unreadable -- please run init",
-                    file=sys.stderr,
+                logger.error(
+                    "error: manifest missing or unreadable -- please run init"
                 )
-            result = 1
+            result = e.exit_code
         except NoSuchProjectError as e:
             if e.name:
-                print("error: project %s not found" % e.name, file=sys.stderr)
+                logger.error("error: project %s not found", e.name)
             else:
-                print("error: no project in current directory", file=sys.stderr)
-            result = 1
+                logger.error("error: no project in current directory")
+            result = e.exit_code
         except InvalidProjectGroupsError as e:
             if e.name:
-                print(
-                    "error: project group must be enabled for project %s"
-                    % e.name,
-                    file=sys.stderr,
+                logger.error(
+                    "error: project group must be enabled for project %s",
+                    e.name,
                 )
             else:
-                print(
+                logger.error(
                     "error: project group must be enabled for the project in "
-                    "the current directory",
-                    file=sys.stderr,
+                    "the current directory"
                 )
-            result = 1
+            result = e.exit_code
         except SystemExit as e:
             if e.code:
                 result = e.code
             raise
         except KeyboardInterrupt:
             result = KEYBOARD_INTERRUPT_EXIT
+            raise
+        except RepoExitError as e:
+            result = e.exit_code
             raise
         except Exception:
             result = 1
@@ -528,7 +530,7 @@ def _CheckWrapperVersion(ver_str, repo_path):
         repo_path = "~/bin/repo"
 
     if not ver_str:
-        print("no --wrapper-version argument", file=sys.stderr)
+        logger.error("no --wrapper-version argument")
         sys.exit(1)
 
     # Pull out the version of the repo launcher we know about to compare.
@@ -537,7 +539,7 @@ def _CheckWrapperVersion(ver_str, repo_path):
 
     exp_str = ".".join(map(str, exp))
     if ver < MIN_REPO_VERSION:
-        print(
+        logger.error(
             """
 repo: error:
 !!! Your version of repo %s is too old.
@@ -546,42 +548,44 @@ repo: error:
 !!! You must upgrade before you can continue:
 
     cp %s %s
-"""
-            % (ver_str, min_str, exp_str, WrapperPath(), repo_path),
-            file=sys.stderr,
+""",
+            ver_str,
+            min_str,
+            exp_str,
+            WrapperPath(),
+            repo_path,
         )
         sys.exit(1)
 
     if exp > ver:
-        print(
-            "\n... A new version of repo (%s) is available." % (exp_str,),
-            file=sys.stderr,
+        logger.warning(
+            "\n... A new version of repo (%s) is available.", exp_str
         )
         if os.access(repo_path, os.W_OK):
-            print(
+            logger.warning(
                 """\
 ... You should upgrade soon:
     cp %s %s
-"""
-                % (WrapperPath(), repo_path),
-                file=sys.stderr,
+""",
+                WrapperPath(),
+                repo_path,
             )
         else:
-            print(
+            logger.warning(
                 """\
 ... New version is available at: %s
 ... The launcher is run from: %s
 !!! The launcher is not writable.  Please talk to your sysadmin or distro
 !!! to get an update installed.
-"""
-                % (WrapperPath(), repo_path),
-                file=sys.stderr,
+""",
+                WrapperPath(),
+                repo_path,
             )
 
 
 def _CheckRepoDir(repo_dir):
     if not repo_dir:
-        print("no --repo-dir argument", file=sys.stderr)
+        logger.error("no --repo-dir argument")
         sys.exit(1)
 
 
@@ -785,7 +789,7 @@ def init_http():
             mgr.add_password(p[1], "https://%s/" % host, p[0], p[2])
     except netrc.NetrcParseError:
         pass
-    except IOError:
+    except OSError:
         pass
     handlers.append(_BasicAuthHandler(mgr))
     handlers.append(_DigestAuthHandler(mgr))
@@ -840,19 +844,19 @@ def _Main(argv):
             SetTraceToStderr()
 
         result = repo._Run(name, gopts, argv) or 0
+    except RepoExitError as e:
+        if not isinstance(e, SilentRepoExitError):
+            logger.log_aggregated_errors(e)
+        result = e.exit_code
     except KeyboardInterrupt:
         print("aborted by user", file=sys.stderr)
         result = KEYBOARD_INTERRUPT_EXIT
-    except ManifestParseError as mpe:
-        print("fatal: %s" % mpe, file=sys.stderr)
-        result = 1
     except RepoChangedException as rce:
         # If repo changed, re-exec ourselves.
-        #
         argv = list(sys.argv)
         argv.extend(rce.extra_args)
         try:
-            os.execv(sys.executable, [__file__] + argv)
+            os.execv(sys.executable, [sys.executable, __file__] + argv)
         except OSError as e:
             print("fatal: cannot restart repo after upgrade", file=sys.stderr)
             print("fatal: %s" % e, file=sys.stderr)

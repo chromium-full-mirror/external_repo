@@ -18,27 +18,24 @@ import os
 import platform
 import re
 import sys
-import xml.dom.minidom
 import urllib.parse
+import xml.dom.minidom
 
-import gitc_utils
+from error import ManifestInvalidPathError
+from error import ManifestInvalidRevisionError
+from error import ManifestParseError
 from git_config import GitConfig
-from git_refs import R_HEADS, HEAD
+from git_refs import HEAD
+from git_refs import R_HEADS
 from git_superproject import Superproject
 import platform_utils
-from project import (
-    Annotation,
-    RemoteSpec,
-    Project,
-    RepoProject,
-    ManifestProject,
-)
-from error import (
-    ManifestParseError,
-    ManifestInvalidPathError,
-    ManifestInvalidRevisionError,
-)
+from project import Annotation
+from project import ManifestProject
+from project import Project
+from project import RemoteSpec
+from project import RepoProject
 from wrapper import Wrapper
+
 
 MANIFEST_FILE_NAME = "manifest.xml"
 LOCAL_MANIFEST_NAME = "local_manifest.xml"
@@ -122,7 +119,7 @@ def XmlInt(node, attr, default=None):
         )
 
 
-class _Default(object):
+class _Default:
     """Project defaults within the manifest."""
 
     revisionExpr = None
@@ -145,7 +142,7 @@ class _Default(object):
         return self.__dict__ != other.__dict__
 
 
-class _XmlRemote(object):
+class _XmlRemote:
     def __init__(
         self,
         name,
@@ -357,7 +354,7 @@ class SubmanifestSpec:
         self.groups = groups or []
 
 
-class XmlManifest(object):
+class XmlManifest:
     """manages the repo configuration file"""
 
     def __init__(
@@ -730,10 +727,10 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
             self._output_manifest_project_extras(p, e)
 
             if p.subprojects:
-                subprojects = set(subp.name for subp in p.subprojects)
+                subprojects = {subp.name for subp in p.subprojects}
                 output_projects(p, e, list(sorted(subprojects)))
 
-        projects = set(p.name for p in self._paths.values() if not p.parent)
+        projects = {p.name for p in self._paths.values() if not p.parent}
         output_projects(None, root, list(sorted(projects)))
 
         if self._repo_hooks_project:
@@ -803,10 +800,10 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
             for child in node.childNodes:
                 if child.nodeType == xml.dom.Node.ELEMENT_NODE:
                     attrs = child.attributes
-                    element = dict(
-                        (attrs.item(i).localName, attrs.item(i).value)
+                    element = {
+                        attrs.item(i).localName: attrs.item(i).value
                         for i in range(attrs.length)
-                    )
+                    }
                     if child.nodeName in SINGLE_ELEMENTS:
                         ret[child.nodeName] = element
                     elif child.nodeName in MULTI_ELEMENTS:
@@ -860,8 +857,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         self._Load()
         outer = self._outer_client
         yield outer
-        for tree in outer.all_children:
-            yield tree
+        yield from outer.all_children
 
     @property
     def all_children(self):
@@ -870,8 +866,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         for child in self._submanifests.values():
             if child.repo_client:
                 yield child.repo_client
-                for tree in child.repo_client.all_children:
-                    yield tree
+                yield from child.repo_client.all_children
 
     @property
     def path_prefix(self):
@@ -990,7 +985,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
     @property
     def PartialCloneExclude(self):
         exclude = self.manifest.manifestProject.partial_clone_exclude or ""
-        return set(x.strip() for x in exclude.split(","))
+        return {x.strip() for x in exclude.split(",")}
 
     def SetManifestOverride(self, path):
         """Override manifestFile.  The caller must call Unload()"""
@@ -1271,7 +1266,10 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
             raise ManifestParseError("no root node in %s" % (path,))
 
         for manifest in root.childNodes:
-            if manifest.nodeName == "manifest":
+            if (
+                manifest.nodeType == manifest.ELEMENT_NODE
+                and manifest.nodeName == "manifest"
+            ):
                 break
         else:
             raise ManifestParseError("no <manifest> in %s" % (path,))
@@ -2213,7 +2211,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         toProjects = manifest.paths
 
         fromKeys = sorted(fromProjects.keys())
-        toKeys = sorted(toProjects.keys())
+        toKeys = set(toProjects.keys())
 
         diff = {
             "added": [],
@@ -2224,13 +2222,13 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         }
 
         for proj in fromKeys:
+            fromProj = fromProjects[proj]
             if proj not in toKeys:
-                diff["removed"].append(fromProjects[proj])
-            elif not fromProjects[proj].Exists:
+                diff["removed"].append(fromProj)
+            elif not fromProj.Exists:
                 diff["missing"].append(toProjects[proj])
                 toKeys.remove(proj)
             else:
-                fromProj = fromProjects[proj]
                 toProj = toProjects[proj]
                 try:
                     fromRevId = fromProj.GetCommitRevisionId()
@@ -2242,25 +2240,9 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
                         diff["changed"].append((fromProj, toProj))
                 toKeys.remove(proj)
 
-        for proj in toKeys:
-            diff["added"].append(toProjects[proj])
+        diff["added"].extend(toProjects[proj] for proj in sorted(toKeys))
 
         return diff
-
-
-class GitcManifest(XmlManifest):
-    """Parser for GitC (git-in-the-cloud) manifests."""
-
-    def _ParseProject(self, node, parent=None):
-        """Override _ParseProject and add support for GITC specific attributes."""  # noqa: E501
-        return super()._ParseProject(
-            node, parent=parent, old_revision=node.getAttribute("old-revision")
-        )
-
-    def _output_manifest_project_extras(self, p, e):
-        """Output GITC Specific Project attributes"""
-        if p.old_revision:
-            e.setAttribute("old-revision", str(p.old_revision))
 
 
 class RepoClient(XmlManifest):
@@ -2315,19 +2297,3 @@ class RepoClient(XmlManifest):
 
         # TODO: Completely separate manifest logic out of the client.
         self.manifest = self
-
-
-class GitcClient(RepoClient, GitcManifest):
-    """Manages a GitC client checkout."""
-
-    def __init__(self, repodir, gitc_client_name):
-        """Initialize the GitcManifest object."""
-        self.gitc_client_name = gitc_client_name
-        self.gitc_client_dir = os.path.join(
-            gitc_utils.get_gitc_manifest_dir(), gitc_client_name
-        )
-
-        super().__init__(
-            repodir, os.path.join(self.gitc_client_dir, ".manifest")
-        )
-        self.isGitcClient = True

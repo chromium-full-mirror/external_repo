@@ -15,7 +15,7 @@
 import contextlib
 import datetime
 import errno
-from http.client import HTTPException
+import http.client
 import json
 import os
 import re
@@ -26,11 +26,15 @@ from typing import Union
 import urllib.error
 import urllib.request
 
-from error import GitError, UploadError
+from error import GitError
+from error import UploadError
+from git_command import GitCommand
+from git_refs import R_CHANGES
+from git_refs import R_HEADS
+from git_refs import R_TAGS
 import platform_utils
 from repo_trace import Trace
-from git_command import GitCommand
-from git_refs import R_CHANGES, R_HEADS, R_TAGS
+
 
 # Prefix that is prepended to all the keys of SyncAnalysisState's data
 # that is saved in the config.
@@ -66,7 +70,7 @@ def _key(name):
     return ".".join(parts)
 
 
-class GitConfig(object):
+class GitConfig:
     _ForUser = None
 
     _ForSystem = None
@@ -176,7 +180,7 @@ class GitConfig(object):
             config_dict[key] = self.GetString(key)
         return config_dict
 
-    def GetBoolean(self, name: str) -> Union[str, None]:
+    def GetBoolean(self, name: str) -> Union[bool, None]:
         """Returns a boolean from the configuration file.
 
         Returns:
@@ -366,7 +370,7 @@ class GitConfig(object):
             with Trace(": parsing %s", self.file):
                 with open(self._json) as fd:
                     return json.load(fd)
-        except (IOError, ValueError):
+        except (OSError, ValueError):
             platform_utils.remove(self._json, missing_ok=True)
             return None
 
@@ -374,7 +378,7 @@ class GitConfig(object):
         try:
             with open(self._json, "w") as fd:
                 json.dump(cache, fd, indent=2)
-        except (IOError, TypeError):
+        except (OSError, TypeError):
             platform_utils.remove(self._json, missing_ok=True)
 
     def _ReadGit(self):
@@ -426,7 +430,7 @@ class RepoConfig(GitConfig):
         return os.path.join(repo_config_dir, ".repoconfig/config")
 
 
-class RefSpec(object):
+class RefSpec:
     """A Git refspec line, split into its components:
 
     forced:  True if the line starts with '+'
@@ -537,7 +541,7 @@ def GetUrlCookieFile(url, quiet):
     yield cookiefile, None
 
 
-class Remote(object):
+class Remote:
     """Configuration options related to a remote."""
 
     def __init__(self, config, name):
@@ -650,7 +654,7 @@ class Remote(object):
                     raise UploadError("%s: %s" % (self.review, str(e)))
                 except urllib.error.URLError as e:
                     raise UploadError("%s: %s" % (self.review, str(e)))
-                except HTTPException as e:
+                except http.client.HTTPException as e:
                     raise UploadError(
                         "%s: %s" % (self.review, e.__class__.__name__)
                     )
@@ -719,7 +723,7 @@ class Remote(object):
         return self._config.GetString(key, all_keys=all_keys)
 
 
-class Branch(object):
+class Branch:
     """Configuration options related to a single branch."""
 
     def __init__(self, config, name):
@@ -791,8 +795,8 @@ class SyncAnalysisState:
                 to be logged.
         """
         self._config = config
-        now = datetime.datetime.utcnow()
-        self._Set("main.synctime", now.isoformat(timespec="microseconds") + "Z")
+        now = datetime.datetime.now(datetime.timezone.utc)
+        self._Set("main.synctime", now.isoformat(timespec="microseconds"))
         self._Set("main.version", "1")
         self._Set("sys.argv", sys.argv)
         for key, value in superproject_logging_data.items():

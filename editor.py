@@ -14,15 +14,15 @@
 
 import os
 import re
-import sys
 import subprocess
+import sys
 import tempfile
 
 from error import EditorError
 import platform_utils
 
 
-class Editor(object):
+class Editor:
     """Manages the user's preferred text editor."""
 
     _editor = None

@@ -12,12 +12,21 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from optparse import SUPPRESS_HELP
-import sys
+import optparse
 
-from command import Command, MirrorSafeCommand
-from subcmds.sync import _PostRepoUpgrade
+from command import Command
+from command import MirrorSafeCommand
+from error import RepoExitError
+from repo_logging import RepoLogger
 from subcmds.sync import _PostRepoFetch
+from subcmds.sync import _PostRepoUpgrade
+
+
+logger = RepoLogger(__file__)
+
+
+class SelfupdateError(RepoExitError):
+    """Exit error for failed selfupdate command."""
 
 
 class Selfupdate(Command, MirrorSafeCommand):
@@ -47,7 +56,7 @@ need to be performed by an end-user.
             "--repo-upgraded",
             dest="repo_upgraded",
             action="store_true",
-            help=SUPPRESS_HELP,
+            help=optparse.SUPPRESS_HELP,
         )
 
     def Execute(self, opt, args):
@@ -58,9 +67,10 @@ need to be performed by an end-user.
             _PostRepoUpgrade(self.manifest)
 
         else:
-            if not rp.Sync_NetworkHalf().success:
-                print("error: can't update repo", file=sys.stderr)
-                sys.exit(1)
+            result = rp.Sync_NetworkHalf()
+            if result.error:
+                logger.error("error: can't update repo")
+                raise SelfupdateError(aggregate_errors=[result.error])
 
             rp.bare_git.gc("--auto")
             _PostRepoFetch(rp, repo_verify=opt.repo_verify, verbose=True)

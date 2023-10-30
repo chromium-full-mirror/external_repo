@@ -16,9 +16,18 @@ import os
 import sys
 
 from color import Coloring
-from command import InteractiveCommand, MirrorSafeCommand
-from git_command import git_require, MIN_GIT_VERSION_SOFT, MIN_GIT_VERSION_HARD
+from command import InteractiveCommand
+from command import MirrorSafeCommand
+from error import RepoUnhandledExceptionError
+from error import UpdateManifestError
+from git_command import git_require
+from git_command import MIN_GIT_VERSION_HARD
+from git_command import MIN_GIT_VERSION_SOFT
+from repo_logging import RepoLogger
 from wrapper import Wrapper
+
+
+logger = RepoLogger(__file__)
 
 _REPO_ALLOW_SHALLOW = os.environ.get("REPO_ALLOW_SHALLOW")
 
@@ -82,8 +91,8 @@ to update the working directory files.
     def _CommonOptions(self, p):
         """Disable due to re-use of Wrapper()."""
 
-    def _Options(self, p, gitc_init=False):
-        Wrapper().InitParser(p, gitc_init=gitc_init)
+    def _Options(self, p):
+        Wrapper().InitParser(p)
         m = p.add_option_group("Multi-manifest")
         m.add_option(
             "--outer-manifest",
@@ -156,7 +165,10 @@ to update the working directory files.
             git_event_log=self.git_event_log,
             manifest_name=opt.manifest_name,
         ):
-            sys.exit(1)
+            manifest_name = opt.manifest_name
+            raise UpdateManifestError(
+                f"Unable to sync manifest {manifest_name}"
+            )
 
     def _Prompt(self, prompt, value):
         print("%-10s [%s]: " % (prompt, value), end="", flush=True)
@@ -321,11 +333,11 @@ to update the working directory files.
     def Execute(self, opt, args):
         git_require(MIN_GIT_VERSION_HARD, fail=True)
         if not git_require(MIN_GIT_VERSION_SOFT):
-            print(
-                "repo: warning: git-%s+ will soon be required; please upgrade "
-                "your version of git to maintain support."
-                % (".".join(str(x) for x in MIN_GIT_VERSION_SOFT),),
-                file=sys.stderr,
+            logger.warning(
+                "repo: warning: git-%s+ will soon be required; "
+                "please upgrade your version of git to maintain "
+                "support.",
+                ".".join(str(x) for x in MIN_GIT_VERSION_SOFT),
             )
 
         rp = self.manifest.repoProject
@@ -346,14 +358,12 @@ to update the working directory files.
                     repo_verify=opt.repo_verify,
                     quiet=opt.quiet,
                 )
-            except wrapper.CloneFailure:
+            except wrapper.CloneFailure as e:
                 err_msg = "fatal: double check your --repo-rev setting."
-                print(
-                    err_msg,
-                    file=sys.stderr,
-                )
+                logger.error(err_msg)
                 self.git_event_log.ErrorEvent(err_msg)
-                sys.exit(1)
+                raise RepoUnhandledExceptionError(e)
+
             branch = rp.GetBranch("default")
             branch.merge = remote_ref
             rp.work_git.reset("--hard", rev)

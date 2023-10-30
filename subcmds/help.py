@@ -16,16 +16,16 @@ import re
 import sys
 import textwrap
 
-from subcmds import all_commands
 from color import Coloring
-from command import (
-    PagedCommand,
-    MirrorSafeCommand,
-    GitcAvailableCommand,
-    GitcClientCommand,
-)
-import gitc_utils
+from command import MirrorSafeCommand
+from command import PagedCommand
+from error import RepoExitError
+from subcmds import all_commands
 from wrapper import Wrapper
+
+
+class InvalidHelpCommand(RepoExitError):
+    """Invalid command passed into help."""
 
 
 class Help(PagedCommand, MirrorSafeCommand):
@@ -74,26 +74,9 @@ Displays detailed usage information about a command.
     def PrintCommonCommandsBody(self):
         print("The most commonly used repo commands are:")
 
-        def gitc_supported(cmd):
-            if not isinstance(cmd, GitcAvailableCommand) and not isinstance(
-                cmd, GitcClientCommand
-            ):
-                return True
-            if self.client.isGitcClient:
-                return True
-            if isinstance(cmd, GitcClientCommand):
-                return False
-            if gitc_utils.get_gitc_manifest_dir():
-                return True
-            return False
-
         commandNames = list(
             sorted(
-                [
-                    name
-                    for name, command in all_commands.items()
-                    if command.COMMON and gitc_supported(command)
-                ]
+                name for name, command in all_commands.items() if command.COMMON
             )
         )
         self._PrintCommands(commandNames)
@@ -202,7 +185,7 @@ Displays detailed usage information about a command.
                 print(
                     "repo: '%s' is not a repo command." % name, file=sys.stderr
                 )
-                sys.exit(1)
+                raise InvalidHelpCommand(name)
 
             self._PrintCommandHelp(cmd)
 

@@ -19,16 +19,26 @@ import re
 import sys
 from typing import List
 
-from command import DEFAULT_LOCAL_JOBS, InteractiveCommand
+from command import DEFAULT_LOCAL_JOBS
+from command import InteractiveCommand
 from editor import Editor
+from error import GitError
+from error import SilentRepoExitError
 from error import UploadError
 from git_command import GitCommand
 from git_refs import R_HEADS
 from hooks import RepoHook
 from project import ReviewableBranch
+from repo_logging import RepoLogger
+from subcmds.sync import LocalSyncState
 
 
 _DEFAULT_UNUSUAL_COMMIT_THRESHOLD = 5
+logger = RepoLogger(__file__)
+
+
+class UploadExitError(SilentRepoExitError):
+    """Indicates that there is an upload command error requiring a sys exit."""
 
 
 def _VerifyPendingCommits(branches: List[ReviewableBranch]) -> bool:
@@ -62,16 +72,16 @@ def _VerifyPendingCommits(branches: List[ReviewableBranch]) -> bool:
     # If any branch has many commits, prompt the user.
     if many_commits:
         if len(branches) > 1:
-            print(
+            logger.warning(
                 "ATTENTION: One or more branches has an unusually high number "
                 "of commits."
             )
         else:
-            print(
+            logger.warning(
                 "ATTENTION: You are uploading an unusually high number of "
                 "commits."
             )
-        print(
+        logger.warning(
             "YOU PROBABLY DO NOT MEAN TO DO THIS. (Did you rebase across "
             "branches?)"
         )
@@ -85,8 +95,8 @@ def _VerifyPendingCommits(branches: List[ReviewableBranch]) -> bool:
 
 def _die(fmt, *args):
     msg = fmt % args
-    print("error: %s" % msg, file=sys.stderr)
-    sys.exit(1)
+    logger.error("error: %s", msg)
+    raise UploadExitError(msg)
 
 
 def _SplitEmails(values):
@@ -528,137 +538,137 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
         except (AttributeError, IndexError):
             return ""
 
-    def _UploadAndReport(self, opt, todo, original_people):
+    def _UploadBranch(self, opt, branch, original_people):
+        """Upload Branch."""
+        people = copy.deepcopy(original_people)
+        self._AppendAutoList(branch, people)
+
+        # Check if there are local changes that may have been forgotten.
+        changes = branch.project.UncommitedFiles()
+        if opt.ignore_untracked_files:
+            untracked = set(branch.project.UntrackedFiles())
+            changes = [x for x in changes if x not in untracked]
+
+        if changes:
+            key = "review.%s.autoupload" % branch.project.remote.review
+            answer = branch.project.config.GetBoolean(key)
+
+            # If they want to auto upload, let's not ask because it
+            # could be automated.
+            if answer is None:
+                print()
+                print(
+                    "Uncommitted changes in %s (did you forget to "
+                    "amend?):" % branch.project.name
+                )
+                print("\n".join(changes))
+                print("Continue uploading? (y/N) ", end="", flush=True)
+                if opt.yes:
+                    print("<--yes>")
+                    a = "yes"
+                else:
+                    a = sys.stdin.readline().strip().lower()
+                if a not in ("y", "yes", "t", "true", "on"):
+                    print("skipping upload", file=sys.stderr)
+                    branch.uploaded = False
+                    branch.error = "User aborted"
+                    return
+
+        # Check if topic branches should be sent to the server during
+        # upload.
+        if opt.auto_topic is not True:
+            key = "review.%s.uploadtopic" % branch.project.remote.review
+            opt.auto_topic = branch.project.config.GetBoolean(key)
+
+        def _ExpandCommaList(value):
+            """Split |value| up into comma delimited entries."""
+            if not value:
+                return
+            for ret in value.split(","):
+                ret = ret.strip()
+                if ret:
+                    yield ret
+
+        # Check if hashtags should be included.
+        key = "review.%s.uploadhashtags" % branch.project.remote.review
+        hashtags = set(_ExpandCommaList(branch.project.config.GetString(key)))
+        for tag in opt.hashtags:
+            hashtags.update(_ExpandCommaList(tag))
+        if opt.hashtag_branch:
+            hashtags.add(branch.name)
+
+        # Check if labels should be included.
+        key = "review.%s.uploadlabels" % branch.project.remote.review
+        labels = set(_ExpandCommaList(branch.project.config.GetString(key)))
+        for label in opt.labels:
+            labels.update(_ExpandCommaList(label))
+
+        # Handle e-mail notifications.
+        if opt.notify is False:
+            notify = "NONE"
+        else:
+            key = "review.%s.uploadnotify" % branch.project.remote.review
+            notify = branch.project.config.GetString(key)
+
+        destination = opt.dest_branch or branch.project.dest_branch
+
+        if branch.project.dest_branch and not opt.dest_branch:
+            merge_branch = self._GetMergeBranch(
+                branch.project, local_branch=branch.name
+            )
+
+            full_dest = destination
+            if not full_dest.startswith(R_HEADS):
+                full_dest = R_HEADS + full_dest
+
+            # If the merge branch of the local branch is different from
+            # the project's revision AND destination, this might not be
+            # intentional.
+            if (
+                merge_branch
+                and merge_branch != branch.project.revisionExpr
+                and merge_branch != full_dest
+            ):
+                print(
+                    f"For local branch {branch.name}: merge branch "
+                    f"{merge_branch} does not match destination branch "
+                    f"{destination}"
+                )
+                print("skipping upload.")
+                print(
+                    f"Please use `--destination {destination}` if this "
+                    "is intentional"
+                )
+                branch.uploaded = False
+                return
+
+        branch.UploadForReview(
+            people,
+            dryrun=opt.dryrun,
+            auto_topic=opt.auto_topic,
+            hashtags=hashtags,
+            labels=labels,
+            private=opt.private,
+            notify=notify,
+            wip=opt.wip,
+            ready=opt.ready,
+            dest_branch=destination,
+            validate_certs=opt.validate_certs,
+            push_options=opt.push_options,
+        )
+
+        branch.uploaded = True
+
+    def _UploadAndReport(self, opt, todo, people):
         have_errors = False
+        aggregate_errors = []
         for branch in todo:
             try:
-                people = copy.deepcopy(original_people)
-                self._AppendAutoList(branch, people)
-
-                # Check if there are local changes that may have been forgotten.
-                changes = branch.project.UncommitedFiles()
-                if opt.ignore_untracked_files:
-                    untracked = set(branch.project.UntrackedFiles())
-                    changes = [x for x in changes if x not in untracked]
-
-                if changes:
-                    key = "review.%s.autoupload" % branch.project.remote.review
-                    answer = branch.project.config.GetBoolean(key)
-
-                    # If they want to auto upload, let's not ask because it
-                    # could be automated.
-                    if answer is None:
-                        print()
-                        print(
-                            "Uncommitted changes in %s (did you forget to "
-                            "amend?):" % branch.project.name
-                        )
-                        print("\n".join(changes))
-                        print("Continue uploading? (y/N) ", end="", flush=True)
-                        if opt.yes:
-                            print("<--yes>")
-                            a = "yes"
-                        else:
-                            a = sys.stdin.readline().strip().lower()
-                        if a not in ("y", "yes", "t", "true", "on"):
-                            print("skipping upload", file=sys.stderr)
-                            branch.uploaded = False
-                            branch.error = "User aborted"
-                            continue
-
-                # Check if topic branches should be sent to the server during
-                # upload.
-                if opt.auto_topic is not True:
-                    key = "review.%s.uploadtopic" % branch.project.remote.review
-                    opt.auto_topic = branch.project.config.GetBoolean(key)
-
-                def _ExpandCommaList(value):
-                    """Split |value| up into comma delimited entries."""
-                    if not value:
-                        return
-                    for ret in value.split(","):
-                        ret = ret.strip()
-                        if ret:
-                            yield ret
-
-                # Check if hashtags should be included.
-                key = "review.%s.uploadhashtags" % branch.project.remote.review
-                hashtags = set(
-                    _ExpandCommaList(branch.project.config.GetString(key))
-                )
-                for tag in opt.hashtags:
-                    hashtags.update(_ExpandCommaList(tag))
-                if opt.hashtag_branch:
-                    hashtags.add(branch.name)
-
-                # Check if labels should be included.
-                key = "review.%s.uploadlabels" % branch.project.remote.review
-                labels = set(
-                    _ExpandCommaList(branch.project.config.GetString(key))
-                )
-                for label in opt.labels:
-                    labels.update(_ExpandCommaList(label))
-
-                # Handle e-mail notifications.
-                if opt.notify is False:
-                    notify = "NONE"
-                else:
-                    key = (
-                        "review.%s.uploadnotify" % branch.project.remote.review
-                    )
-                    notify = branch.project.config.GetString(key)
-
-                destination = opt.dest_branch or branch.project.dest_branch
-
-                if branch.project.dest_branch and not opt.dest_branch:
-                    merge_branch = self._GetMergeBranch(
-                        branch.project, local_branch=branch.name
-                    )
-
-                    full_dest = destination
-                    if not full_dest.startswith(R_HEADS):
-                        full_dest = R_HEADS + full_dest
-
-                    # If the merge branch of the local branch is different from
-                    # the project's revision AND destination, this might not be
-                    # intentional.
-                    if (
-                        merge_branch
-                        and merge_branch != branch.project.revisionExpr
-                        and merge_branch != full_dest
-                    ):
-                        print(
-                            f"For local branch {branch.name}: merge branch "
-                            f"{merge_branch} does not match destination branch "
-                            f"{destination}"
-                        )
-                        print("skipping upload.")
-                        print(
-                            f"Please use `--destination {destination}` if this "
-                            "is intentional"
-                        )
-                        branch.uploaded = False
-                        continue
-
-                branch.UploadForReview(
-                    people,
-                    dryrun=opt.dryrun,
-                    auto_topic=opt.auto_topic,
-                    hashtags=hashtags,
-                    labels=labels,
-                    private=opt.private,
-                    notify=notify,
-                    wip=opt.wip,
-                    ready=opt.ready,
-                    dest_branch=destination,
-                    validate_certs=opt.validate_certs,
-                    push_options=opt.push_options,
-                )
-
-                branch.uploaded = True
-            except UploadError as e:
+                self._UploadBranch(opt, branch, people)
+            except (UploadError, GitError) as e:
                 self.git_event_log.ErrorEvent(f"upload error: {e}")
                 branch.error = e
+                aggregate_errors.append(e)
                 branch.uploaded = False
                 have_errors = True
 
@@ -697,7 +707,7 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
                 )
 
         if have_errors:
-            sys.exit(1)
+            raise UploadExitError(aggregate_errors=aggregate_errors)
 
     def _GetMergeBranch(self, project, local_branch=None):
         if local_branch is None:
@@ -740,16 +750,13 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
             for result in results:
                 project, avail = result
                 if avail is None:
-                    print(
+                    logger.error(
                         'repo: error: %s: Unable to upload branch "%s". '
                         "You might be able to fix the branch by running:\n"
-                        "  git branch --set-upstream-to m/%s"
-                        % (
-                            project.RelPath(local=opt.this_manifest_only),
-                            project.CurrentBranch,
-                            project.manifest.branch,
-                        ),
-                        file=sys.stderr,
+                        "  git branch --set-upstream-to m/%s",
+                        project.RelPath(local=opt.this_manifest_only),
+                        project.CurrentBranch,
+                        project.manifest.branch,
                     )
                 elif avail:
                     pending.append(result)
@@ -764,14 +771,11 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
 
         if not pending:
             if opt.branch is None:
-                print(
-                    "repo: error: no branches ready for upload", file=sys.stderr
-                )
+                logger.error("repo: error: no branches ready for upload")
             else:
-                print(
-                    'repo: error: no branches named "%s" ready for upload'
-                    % (opt.branch,),
-                    file=sys.stderr,
+                logger.error(
+                    'repo: error: no branches named "%s" ready for upload',
+                    opt.branch,
                 )
             return 1
 
@@ -800,6 +804,11 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
             if not hook.Run(
                 project_list=pending_proj_names, worktree_list=pending_worktrees
             ):
+                if LocalSyncState(manifest).IsPartiallySynced():
+                    logger.error(
+                        "Partially synced tree detected. Syncing all projects "
+                        "may resolve issues you're seeing."
+                    )
                 ret = 1
         if ret:
             return ret

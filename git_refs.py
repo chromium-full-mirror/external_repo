@@ -13,8 +13,10 @@
 # limitations under the License.
 
 import os
-from repo_trace import Trace
+
 import platform_utils
+from repo_trace import Trace
+
 
 HEAD = "HEAD"
 R_CHANGES = "refs/changes/"
@@ -26,7 +28,7 @@ R_WORKTREE_M = R_WORKTREE + "m/"
 R_M = "refs/remotes/m/"
 
 
-class GitRefs(object):
+class GitRefs:
     def __init__(self, gitdir):
         self._gitdir = gitdir
         self._phyref = None
@@ -103,10 +105,8 @@ class GitRefs(object):
     def _ReadPackedRefs(self):
         path = os.path.join(self._gitdir, "packed-refs")
         try:
-            fd = open(path, "r")
+            fd = open(path)
             mtime = os.path.getmtime(path)
-        except IOError:
-            return
         except OSError:
             return
         try:

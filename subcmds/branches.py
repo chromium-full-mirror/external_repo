@@ -16,7 +16,8 @@ import itertools
 import sys
 
 from color import Coloring
-from command import Command, DEFAULT_LOCAL_JOBS
+from command import Command
+from command import DEFAULT_LOCAL_JOBS
 
 
 class BranchColoring(Coloring):
@@ -27,7 +28,7 @@ class BranchColoring(Coloring):
         self.notinproject = self.printer("notinproject", fg="red")
 
 
-class BranchInfo(object):
+class BranchInfo:
     def __init__(self, name):
         self.name = name
         self.current = 0
