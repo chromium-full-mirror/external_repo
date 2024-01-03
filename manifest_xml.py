@@ -114,9 +114,37 @@ def XmlInt(node, attr, default=None):
     try:
         return int(value)
     except ValueError:
-        raise ManifestParseError(
-            'manifest: invalid %s="%s" integer' % (attr, value)
-        )
+        raise ManifestParseError(f'manifest: invalid {attr}="{value}" integer')
+
+
+def normalize_url(url: str) -> str:
+    """Mutate input 'url' into normalized form:
+
+    * remove trailing slashes
+    * convert SCP-like syntax to SSH URL
+
+    Args:
+        url: URL to modify
+
+    Returns:
+        The normalized URL.
+    """
+
+    url = url.rstrip("/")
+    parsed_url = urllib.parse.urlparse(url)
+
+    # This matches patterns like "git@github.com:foo/bar".
+    scp_like_url_re = r"^[^:]+@[^:]+:[^/]+/"
+
+    # If our URL is missing a schema and matches git's
+    # SCP-like syntax we should convert it to a proper
+    # SSH URL instead to make urljoin() happier.
+    #
+    # See: https://git-scm.com/docs/git-clone#URLS
+    if not parsed_url.scheme and re.match(scp_like_url_re, url):
+        return "ssh://" + url.replace(":", "/", 1)
+
+    return url
 
 
 class _Default:
@@ -182,20 +210,22 @@ class _XmlRemote:
     def _resolveFetchUrl(self):
         if self.fetchUrl is None:
             return ""
-        url = self.fetchUrl.rstrip("/")
-        manifestUrl = self.manifestUrl.rstrip("/")
-        # urljoin will gets confused over quite a few things.  The ones we care
-        # about here are:
-        # * no scheme in the base url, like <hostname:port>
-        # We handle no scheme by replacing it with an obscure protocol, gopher
-        # and then replacing it with the original when we are done.
 
-        if manifestUrl.find(":") != manifestUrl.find("/") - 1:
-            url = urllib.parse.urljoin("gopher://" + manifestUrl, url)
-            url = re.sub(r"^gopher://", "", url)
+        fetch_url = normalize_url(self.fetchUrl)
+        manifest_url = normalize_url(self.manifestUrl)
+
+        # urljoin doesn't like URLs with no scheme in the base URL
+        # such as file paths.  We handle this by prefixing it with
+        # an obscure protocol, gopher, and replacing it with the
+        # original after urljoin
+        if manifest_url.find(":") != manifest_url.find("/") - 1:
+            fetch_url = urllib.parse.urljoin(
+                "gopher://" + manifest_url, fetch_url
+            )
+            fetch_url = re.sub(r"^gopher://", "", fetch_url)
         else:
-            url = urllib.parse.urljoin(manifestUrl, url)
-        return url
+            fetch_url = urllib.parse.urljoin(manifest_url, fetch_url)
+        return fetch_url
 
     def ToRemoteSpec(self, projectName):
         fetchUrl = self.resolvedFetchUrl.rstrip("/")
@@ -275,7 +305,7 @@ class _XmlSubmanifest:
             parent.repodir,
             linkFile,
             parent_groups=",".join(groups) or "",
-            submanifest_path=self.relpath,
+            submanifest_path=os.path.join(parent.path_prefix, self.relpath),
             outer_client=outer_client,
             default_groups=default_groups,
         )
@@ -810,7 +840,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
                         ret.setdefault(child.nodeName, []).append(element)
                     else:
                         raise ManifestParseError(
-                            'Unhandled element "%s"' % (child.nodeName,)
+                            f'Unhandled element "{child.nodeName}"'
                         )
 
                     append_children(element, child)
@@ -1258,12 +1288,10 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         try:
             root = xml.dom.minidom.parse(path)
         except (OSError, xml.parsers.expat.ExpatError) as e:
-            raise ManifestParseError(
-                "error parsing manifest %s: %s" % (path, e)
-            )
+            raise ManifestParseError(f"error parsing manifest {path}: {e}")
 
         if not root or not root.childNodes:
-            raise ManifestParseError("no root node in %s" % (path,))
+            raise ManifestParseError(f"no root node in {path}")
 
         for manifest in root.childNodes:
             if (
@@ -1272,7 +1300,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
             ):
                 break
         else:
-            raise ManifestParseError("no <manifest> in %s" % (path,))
+            raise ManifestParseError(f"no <manifest> in {path}")
 
         nodes = []
         for node in manifest.childNodes:
@@ -1282,7 +1310,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
                     msg = self._CheckLocalPath(name)
                     if msg:
                         raise ManifestInvalidPathError(
-                            '<include> invalid "name": %s: %s' % (name, msg)
+                            f'<include> invalid "name": {name}: {msg}'
                         )
                 include_groups = ""
                 if parent_groups:
@@ -1314,7 +1342,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
                     raise
                 except Exception as e:
                     raise ManifestParseError(
-                        "failed parsing included manifest %s: %s" % (name, e)
+                        f"failed parsing included manifest {name}: {e}"
                     )
             else:
                 if parent_groups and node.nodeName == "project":
@@ -1765,13 +1793,13 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
                 msg = self._CheckLocalPath(name)
                 if msg:
                     raise ManifestInvalidPathError(
-                        '<submanifest> invalid "name": %s: %s' % (name, msg)
+                        f'<submanifest> invalid "name": {name}: {msg}'
                     )
         else:
             msg = self._CheckLocalPath(path)
             if msg:
                 raise ManifestInvalidPathError(
-                    '<submanifest> invalid "path": %s: %s' % (path, msg)
+                    f'<submanifest> invalid "path": {path}: {msg}'
                 )
 
         submanifest = _XmlSubmanifest(
@@ -1806,7 +1834,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         msg = self._CheckLocalPath(name, dir_ok=True)
         if msg:
             raise ManifestInvalidPathError(
-                '<project> invalid "name": %s: %s' % (name, msg)
+                f'<project> invalid "name": {name}: {msg}'
             )
         if parent:
             name = self._JoinName(parent.name, name)
@@ -1816,7 +1844,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
             remote = self._default.remote
         if remote is None:
             raise ManifestParseError(
-                "no remote for project %s within %s" % (name, self.manifestFile)
+                f"no remote for project {name} within {self.manifestFile}"
             )
 
         revisionExpr = node.getAttribute("revision") or remote.revision
@@ -1837,7 +1865,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
             msg = self._CheckLocalPath(path, dir_ok=True, cwd_dot_ok=True)
             if msg:
                 raise ManifestInvalidPathError(
-                    '<project> invalid "path": %s: %s' % (path, msg)
+                    f'<project> invalid "path": {path}: {msg}'
                 )
 
         rebase = XmlBool(node, "rebase", True)
@@ -2094,7 +2122,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         if not cwd_dot_ok or parts != ["."]:
             for part in set(parts):
                 if part in {".", "..", ".git"} or part.startswith(".repo"):
-                    return "bad component: %s" % (part,)
+                    return f"bad component: {part}"
 
         if not dir_ok and resep.match(path[-1]):
             return "dirs not allowed"
@@ -2130,7 +2158,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         msg = cls._CheckLocalPath(dest)
         if msg:
             raise ManifestInvalidPathError(
-                '<%s> invalid "dest": %s: %s' % (element, dest, msg)
+                f'<{element}> invalid "dest": {dest}: {msg}'
             )
 
         # |src| is the file we read from or path we point to for symlinks.
@@ -2141,7 +2169,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         )
         if msg:
             raise ManifestInvalidPathError(
-                '<%s> invalid "src": %s: %s' % (element, src, msg)
+                f'<{element}> invalid "src": {src}: {msg}'
             )
 
     def _ParseCopyFile(self, project, node):
@@ -2185,7 +2213,7 @@ https://gerrit.googlesource.com/git-repo/+/HEAD/docs/manifest-format.md
         v = self._remotes.get(name)
         if not v:
             raise ManifestParseError(
-                "remote %s not defined in %s" % (name, self.manifestFile)
+                f"remote {name} not defined in {self.manifestFile}"
             )
         return v
 
