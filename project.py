@@ -1358,7 +1358,20 @@ class Project:
         if is_new:
             self._InitGitDir(force_sync=force_sync, quiet=quiet)
         else:
-            self._UpdateHooks(quiet=quiet)
+            try:
+                # At this point, it's possible that gitdir points to an old
+                # objdir (e.g. name changed, but objdir exists). Check
+                # references to ensure that's not the case. See
+                # https://issues.gerritcodereview.com/40013418 for more
+                # details.
+                self._CheckDirReference(self.objdir, self.gitdir)
+
+                self._UpdateHooks(quiet=quiet)
+            except GitError as e:
+                if not force_sync:
+                    raise e
+                # Let _InitGitDir fix the issue, force_sync is always True here.
+                self._InitGitDir(force_sync=True, quiet=quiet)
         self._InitRemote()
 
         if self.UseAlternates:
@@ -1719,9 +1732,9 @@ class Project:
             elif pub == head:
                 # All published commits are merged, and thus we are a
                 # strict subset.  We can fast-forward safely.
-                syncbuf.later1(self, _doff)
+                syncbuf.later1(self, _doff, not verbose)
                 if submodules:
-                    syncbuf.later1(self, _dosubmodules)
+                    syncbuf.later1(self, _dosubmodules, not verbose)
                 return
 
         # Examine the local commits not in the remote.  Find the
@@ -1780,10 +1793,10 @@ class Project:
             def _dorebase():
                 self._Rebase(upstream="%s^1" % last_mine, onto=revid)
 
-            syncbuf.later2(self, _dorebase)
+            syncbuf.later2(self, _dorebase, not verbose)
             if submodules:
-                syncbuf.later2(self, _dosubmodules)
-            syncbuf.later2(self, _docopyandlink)
+                syncbuf.later2(self, _dosubmodules, not verbose)
+            syncbuf.later2(self, _docopyandlink, not verbose)
         elif local_changes:
             try:
                 self._ResetHard(revid)
@@ -1794,9 +1807,9 @@ class Project:
                 fail(e)
                 return
         else:
-            syncbuf.later1(self, _doff)
+            syncbuf.later1(self, _doff, not verbose)
             if submodules:
-                syncbuf.later1(self, _dosubmodules)
+                syncbuf.later1(self, _dosubmodules, not verbose)
 
     def AddCopyFile(self, src, dest, topdir):
         """Mark |src| for copying to |dest| (relative to |topdir|).
@@ -1931,7 +1944,7 @@ class Project:
                     platform_utils.remove(path)
                 except OSError as e:
                     if e.errno != errno.ENOENT:
-                        logger.error("error: %s: Failed to remove: %s", path, e)
+                        logger.warning("%s: Failed to remove: %s", path, e)
                         failed = True
                         errors.append(e)
             dirs[:] = [
@@ -1950,7 +1963,7 @@ class Project:
                     platform_utils.remove(d)
                 except OSError as e:
                     if e.errno != errno.ENOENT:
-                        logger.error("error: %s: Failed to remove: %s", d, e)
+                        logger.warning("%s: Failed to remove: %s", d, e)
                         failed = True
                         errors.append(e)
             elif not platform_utils.listdir(d):
@@ -1958,18 +1971,30 @@ class Project:
                     platform_utils.rmdir(d)
                 except OSError as e:
                     if e.errno != errno.ENOENT:
-                        logger.error("error: %s: Failed to remove: %s", d, e)
+                        logger.warning("%s: Failed to remove: %s", d, e)
                         failed = True
                         errors.append(e)
         if failed:
-            logger.error(
-                "error: %s: Failed to delete obsolete checkout.",
-                self.RelPath(local=False),
+            rename_path = (
+                f"{self.worktree}_repo_to_be_deleted_{int(time.time())}"
             )
-            logger.error(
-                "       Remove manually, then run `repo sync -l`.",
-            )
-            raise DeleteWorktreeError(aggregate_errors=errors)
+            try:
+                platform_utils.rename(self.worktree, rename_path)
+                logger.warning(
+                    "warning: renamed %s to %s. You can delete it, but you "
+                    "might need elevated permissions (e.g. root)",
+                    self.worktree,
+                    rename_path,
+                )
+                # Rename successful! Clear the errors.
+                errors = []
+            except OSError:
+                logger.error(
+                    "%s: Failed to delete obsolete checkout.\n",
+                    "       Remove manually, then run `repo sync -l`.",
+                    self.RelPath(local=False),
+                )
+                raise DeleteWorktreeError(aggregate_errors=errors)
 
         # Try deleting parent dirs if they are empty.
         path = self.worktree
@@ -2966,10 +2991,12 @@ class Project:
         if GitCommand(self, cmd).Wait() != 0:
             raise GitError(f"{self.name} rebase {upstream} ", project=self.name)
 
-    def _FastForward(self, head, ffonly=False):
+    def _FastForward(self, head, ffonly=False, quiet=True):
         cmd = ["merge", "--no-stat", head]
         if ffonly:
             cmd.append("--ff-only")
+        if quiet:
+            cmd.append("-q")
         if GitCommand(self, cmd).Wait() != 0:
             raise GitError(f"{self.name} merge {head} ", project=self.name)
 
@@ -3842,17 +3869,20 @@ class _Failure:
 
 
 class _Later:
-    def __init__(self, project, action):
+    def __init__(self, project, action, quiet):
         self.project = project
         self.action = action
+        self.quiet = quiet
 
     def Run(self, syncbuf):
         out = syncbuf.out
-        out.project("project %s/", self.project.RelPath(local=False))
-        out.nl()
+        if not self.quiet:
+            out.project("project %s/", self.project.RelPath(local=False))
+            out.nl()
         try:
             self.action()
-            out.nl()
+            if not self.quiet:
+                out.nl()
             return True
         except GitError:
             out.nl()
@@ -3888,11 +3918,11 @@ class SyncBuffer:
         self._failures.append(_Failure(project, err))
         self._MarkUnclean()
 
-    def later1(self, project, what):
-        self._later_queue1.append(_Later(project, what))
+    def later1(self, project, what, quiet):
+        self._later_queue1.append(_Later(project, what, quiet))
 
-    def later2(self, project, what):
-        self._later_queue2.append(_Later(project, what))
+    def later2(self, project, what, quiet):
+        self._later_queue2.append(_Later(project, what, quiet))
 
     def Finish(self):
         self._PrintMessages()

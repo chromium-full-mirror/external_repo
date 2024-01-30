@@ -1139,6 +1139,20 @@ class NormalizeUrlTests(ManifestParseTestCase):
             "http://foo.com/bar/baz", manifest_xml.normalize_url(url)
         )
 
+        url = "http://foo.com/bar/"
+        self.assertEqual("http://foo.com/bar", manifest_xml.normalize_url(url))
+
+    def test_has_leading_slash(self):
+        """SCP-like syntax except a / comes before the : which git disallows."""
+        url = "/git@foo.com:bar/baf"
+        self.assertEqual(url, manifest_xml.normalize_url(url))
+
+        url = "gi/t@foo.com:bar/baf"
+        self.assertEqual(url, manifest_xml.normalize_url(url))
+
+        url = "git@fo/o.com:bar/baf"
+        self.assertEqual(url, manifest_xml.normalize_url(url))
+
     def test_has_no_scheme(self):
         """Deal with cases where we have no scheme, but we also
         aren't dealing with the git SCP-like syntax
@@ -1146,7 +1160,13 @@ class NormalizeUrlTests(ManifestParseTestCase):
         url = "foo.com/baf/bat"
         self.assertEqual(url, manifest_xml.normalize_url(url))
 
+        url = "foo.com/baf"
+        self.assertEqual(url, manifest_xml.normalize_url(url))
+
         url = "git@foo.com/baf/bat"
+        self.assertEqual(url, manifest_xml.normalize_url(url))
+
+        url = "git@foo.com/baf"
         self.assertEqual(url, manifest_xml.normalize_url(url))
 
         url = "/file/path/here"
@@ -1157,3 +1177,30 @@ class NormalizeUrlTests(ManifestParseTestCase):
         self.assertEqual(
             "ssh://git@foo.com/bar/baf", manifest_xml.normalize_url(url)
         )
+
+        url = "git@foo.com:bar/"
+        self.assertEqual(
+            "ssh://git@foo.com/bar", manifest_xml.normalize_url(url)
+        )
+
+    def test_remote_url_resolution(self):
+        remote = manifest_xml._XmlRemote(
+            name="foo",
+            fetch="git@github.com:org2/",
+            manifestUrl="git@github.com:org2/custom_manifest.git",
+        )
+        self.assertEqual("ssh://git@github.com/org2", remote.resolvedFetchUrl)
+
+        remote = manifest_xml._XmlRemote(
+            name="foo",
+            fetch="ssh://git@github.com/org2/",
+            manifestUrl="git@github.com:org2/custom_manifest.git",
+        )
+        self.assertEqual("ssh://git@github.com/org2", remote.resolvedFetchUrl)
+
+        remote = manifest_xml._XmlRemote(
+            name="foo",
+            fetch="git@github.com:org2/",
+            manifestUrl="ssh://git@github.com/org2/custom_manifest.git",
+        )
+        self.assertEqual("ssh://git@github.com/org2", remote.resolvedFetchUrl)
