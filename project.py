@@ -21,6 +21,7 @@ import random
 import re
 import shutil
 import stat
+import string
 import subprocess
 import sys
 import tarfile
@@ -269,6 +270,7 @@ class ReviewableBranch:
         dest_branch=None,
         validate_certs=True,
         push_options=None,
+        patchset_description=None,
     ):
         self.project.UploadForReview(
             branch=self.name,
@@ -284,6 +286,7 @@ class ReviewableBranch:
             dest_branch=dest_branch,
             validate_certs=validate_certs,
             push_options=push_options,
+            patchset_description=patchset_description,
         )
 
     def GetPublishedRefs(self):
@@ -1092,6 +1095,7 @@ class Project:
         dest_branch=None,
         validate_certs=True,
         push_options=None,
+        patchset_description=None,
     ):
         """Uploads the named branch for code review."""
         if branch is None:
@@ -1174,6 +1178,10 @@ class Project:
             opts += ["wip"]
         if ready:
             opts += ["ready"]
+        if patchset_description:
+            opts += [
+                f"m={self._encode_patchset_description(patchset_description)}"
+            ]
         if opts:
             ref_spec = ref_spec + "%" + ",".join(opts)
         cmd.append(ref_spec)
@@ -1185,6 +1193,30 @@ class Project:
             self.bare_git.UpdateRef(
                 R_PUB + branch.name, R_HEADS + branch.name, message=msg
             )
+
+    @staticmethod
+    def _encode_patchset_description(original):
+        """Applies percent-encoding for strings sent as patchset description.
+
+        The encoding used is based on but stricter than URL encoding (Section
+        2.1 of RFC 3986). The only non-escaped characters are alphanumerics, and
+        'SPACE' (U+0020) can be represented as 'LOW LINE' (U+005F) or
+        'PLUS SIGN' (U+002B).
+
+        For more information, see the Gerrit docs here:
+        https://gerrit-review.googlesource.com/Documentation/user-upload.html#patch_set_description
+        """
+        SAFE = {ord(x) for x in string.ascii_letters + string.digits}
+
+        def _enc(b):
+            if b in SAFE:
+                return chr(b)
+            elif b == ord(" "):
+                return "_"
+            else:
+                return f"%{b:02x}"
+
+        return "".join(_enc(x) for x in original.encode("utf-8"))
 
     def _ExtractArchive(self, tarpath, path=None):
         """Extract the given tar on its current location
@@ -1579,6 +1611,7 @@ class Project:
         self,
         syncbuf,
         force_sync=False,
+        force_checkout=False,
         submodules=False,
         errors=None,
         verbose=False,
@@ -1666,7 +1699,7 @@ class Project:
                     syncbuf.info(self, "discarding %d commits", len(lost))
 
             try:
-                self._Checkout(revid, quiet=True)
+                self._Checkout(revid, force_checkout=force_checkout, quiet=True)
                 if submodules:
                     self._SyncSubmodules(quiet=True)
             except GitError as e:
@@ -2921,10 +2954,12 @@ class Project:
         except OSError:
             return False
 
-    def _Checkout(self, rev, quiet=False):
+    def _Checkout(self, rev, force_checkout=False, quiet=False):
         cmd = ["checkout"]
         if quiet:
             cmd.append("-q")
+        if force_checkout:
+            cmd.append("-f")
         cmd.append(rev)
         cmd.append("--")
         if GitCommand(self, cmd).Wait() != 0:
