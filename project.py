@@ -148,7 +148,7 @@ def _ProjectHooks():
     """
     global _project_hook_list
     if _project_hook_list is None:
-        d = platform_utils.realpath(os.path.abspath(os.path.dirname(__file__)))
+        d = os.path.realpath(os.path.abspath(os.path.dirname(__file__)))
         d = os.path.join(d, "hooks")
         _project_hook_list = [
             os.path.join(d, x) for x in platform_utils.listdir(d)
@@ -260,7 +260,7 @@ class ReviewableBranch:
         self,
         people,
         dryrun=False,
-        auto_topic=False,
+        topic=None,
         hashtags=(),
         labels=(),
         private=False,
@@ -276,7 +276,7 @@ class ReviewableBranch:
             branch=self.name,
             people=people,
             dryrun=dryrun,
-            auto_topic=auto_topic,
+            topic=topic,
             hashtags=hashtags,
             labels=labels,
             private=private,
@@ -730,11 +730,33 @@ class Project:
         return None
 
     def IsRebaseInProgress(self):
+        """Returns true if a rebase or "am" is in progress"""
+        # "rebase-apply" is used for "git rebase".
+        # "rebase-merge" is used for "git am".
         return (
             os.path.exists(self.work_git.GetDotgitPath("rebase-apply"))
             or os.path.exists(self.work_git.GetDotgitPath("rebase-merge"))
             or os.path.exists(os.path.join(self.worktree, ".dotest"))
         )
+
+    def IsCherryPickInProgress(self):
+        """Returns True if a cherry-pick is in progress."""
+        return os.path.exists(self.work_git.GetDotgitPath("CHERRY_PICK_HEAD"))
+
+    def _AbortRebase(self):
+        """Abort ongoing rebase, cherry-pick or patch apply (am).
+
+        If no rebase, cherry-pick or patch apply was in progress, this method
+        ignores the status and continues.
+        """
+
+        def _git(*args):
+            # Ignore return code, in case there was no rebase in progress.
+            GitCommand(self, *args, log_as_error=False).Wait()
+
+        _git("cherry-pick", "--abort")
+        _git("rebase", "--abort")
+        _git("am", "--abort")
 
     def IsDirty(self, consider_untracked=True):
         """Is the working directory modified in some way?"""
@@ -1085,7 +1107,7 @@ class Project:
         branch=None,
         people=([], []),
         dryrun=False,
-        auto_topic=False,
+        topic=None,
         hashtags=(),
         labels=(),
         private=False,
@@ -1148,8 +1170,7 @@ class Project:
         # This stops git from pushing all reachable annotated tags when
         # push.followTags is configured. Gerrit does not accept any tags
         # pushed to a CL.
-        if git_require((1, 8, 3)):
-            cmd.append("--no-follow-tags")
+        cmd.append("--no-follow-tags")
 
         for push_option in push_options or []:
             cmd.append("-o")
@@ -1162,8 +1183,8 @@ class Project:
 
         ref_spec = f"{R_HEADS + branch.name}:refs/for/{dest_branch}"
         opts = []
-        if auto_topic:
-            opts += ["topic=" + branch.name]
+        if topic is not None:
+            opts += [f"topic={topic}"]
         opts += ["t=%s" % p for p in hashtags]
         # NB: No need to encode labels as they've been validated above.
         opts += ["l=%s" % p for p in labels]
@@ -1558,8 +1579,6 @@ class Project:
         self._InitHooks()
 
     def _CopyAndLinkFiles(self):
-        if self.client.isGitcClient:
-            return
         for copyfile in self.copyfiles:
             copyfile._Copy()
         for linkfile in self.linkfiles:
@@ -1682,7 +1701,15 @@ class Project:
         if branch is None or syncbuf.detach_head:
             # Currently on a detached HEAD.  The user is assumed to
             # not have any local modifications worth worrying about.
-            if self.IsRebaseInProgress():
+            rebase_in_progress = (
+                self.IsRebaseInProgress() or self.IsCherryPickInProgress()
+            )
+            if rebase_in_progress and force_checkout:
+                self._AbortRebase()
+                rebase_in_progress = (
+                    self.IsRebaseInProgress() or self.IsCherryPickInProgress()
+                )
+            if rebase_in_progress:
                 fail(_PriorSyncFailedError(project=self.name))
                 return
 
@@ -1922,7 +1949,7 @@ class Project:
         # remove because it will recursively delete projects -- we handle that
         # ourselves below.  https://crbug.com/git/48
         if self.use_git_worktrees:
-            needle = platform_utils.realpath(self.gitdir)
+            needle = os.path.realpath(self.gitdir)
             # Find the git worktree commondir under .repo/worktrees/.
             output = self.bare_git.worktree("list", "--porcelain").splitlines()[
                 0
@@ -1936,7 +1963,7 @@ class Project:
                 with open(gitdir) as fp:
                     relpath = fp.read().strip()
                 # Resolve the checkout path and see if it matches this project.
-                fullpath = platform_utils.realpath(
+                fullpath = os.path.realpath(
                     os.path.join(configs, name, relpath)
                 )
                 if fullpath == needle:
@@ -2663,12 +2690,7 @@ class Project:
             branch = None
         else:
             branch = self.revisionExpr
-        if (
-            not self.manifest.IsMirror
-            and is_sha1
-            and depth
-            and git_require((1, 8, 3))
-        ):
+        if not self.manifest.IsMirror and is_sha1 and depth:
             # Shallow checkout of a specific commit, fetch from that commit and
             # not the heads only as the commit might be deeper in the history.
             spec.append(branch)
@@ -2880,6 +2902,8 @@ class Project:
     def _FetchBundle(self, srcUrl, tmpPath, dstPath, quiet, verbose):
         platform_utils.remove(dstPath, missing_ok=True)
 
+        # We do not use curl's --retry option since it generally doesn't
+        # actually retry anything; code 18 for example, it will not retry on.
         cmd = ["curl", "--fail", "--output", tmpPath, "--netrc", "--location"]
         if quiet:
             cmd += ["--silent", "--show-error"]
@@ -2916,11 +2940,18 @@ class Project:
             (output, _) = proc.communicate()
             curlret = proc.returncode
 
-            if curlret == 22:
+            if curlret in (22, 35, 56, 92):
+                # We use --fail so curl exits with unique status.
                 # From curl man page:
-                # 22: HTTP page not retrieved. The requested url was not found
-                # or returned another error with the HTTP error code being 400
-                # or above. This return code only appears if -f, --fail is used.
+                # 22: HTTP page not retrieved.  The requested url was not found
+                #     or returned another error with the HTTP error code being
+                #     400 or above.
+                # 35: SSL connect error.  The SSL handshaking failed.  This can
+                #     be thrown by Google storage sometimes.
+                # 56: Failure in receiving network data.  This shows up with
+                #     HTTP/404 on Google storage.
+                # 92: Stream error in HTTP/2 framing layer.  Basically the same
+                #     as 22 -- Google storage sometimes throws 500's.
                 if verbose:
                     print(
                         "%s: Unable to retrieve clone.bundle; ignoring."
@@ -3071,14 +3102,12 @@ class Project:
                             "Retrying clone after deleting %s", self.gitdir
                         )
                         try:
-                            platform_utils.rmtree(
-                                platform_utils.realpath(self.gitdir)
-                            )
+                            platform_utils.rmtree(os.path.realpath(self.gitdir))
                             if self.worktree and os.path.exists(
-                                platform_utils.realpath(self.worktree)
+                                os.path.realpath(self.worktree)
                             ):
                                 platform_utils.rmtree(
-                                    platform_utils.realpath(self.worktree)
+                                    os.path.realpath(self.worktree)
                                 )
                             return self._InitGitDir(
                                 mirror_git=mirror_git,
@@ -3164,7 +3193,7 @@ class Project:
             self._InitHooks(quiet=quiet)
 
     def _InitHooks(self, quiet=False):
-        hooks = platform_utils.realpath(os.path.join(self.objdir, "hooks"))
+        hooks = os.path.realpath(os.path.join(self.objdir, "hooks"))
         if not os.path.exists(hooks):
             os.makedirs(hooks)
 
@@ -3307,9 +3336,9 @@ class Project:
             dst_path = os.path.join(destdir, name)
             src_path = os.path.join(srcdir, name)
 
-            dst = platform_utils.realpath(dst_path)
+            dst = os.path.realpath(dst_path)
             if os.path.lexists(dst):
-                src = platform_utils.realpath(src_path)
+                src = os.path.realpath(src_path)
                 # Fail if the links are pointing to the wrong place.
                 if src != dst:
                     logger.error(
@@ -3345,10 +3374,10 @@ class Project:
         if copy_all:
             to_copy = platform_utils.listdir(gitdir)
 
-        dotgit = platform_utils.realpath(dotgit)
+        dotgit = os.path.realpath(dotgit)
         for name in set(to_copy).union(to_symlink):
             try:
-                src = platform_utils.realpath(os.path.join(gitdir, name))
+                src = os.path.realpath(os.path.join(gitdir, name))
                 dst = os.path.join(dotgit, name)
 
                 if os.path.lexists(dst):
@@ -3445,9 +3474,7 @@ class Project:
         else:
             if not init_dotgit:
                 # See if the project has changed.
-                if platform_utils.realpath(
-                    self.gitdir
-                ) != platform_utils.realpath(dotgit):
+                if os.path.realpath(self.gitdir) != os.path.realpath(dotgit):
                     platform_utils.remove(dotgit)
 
             if init_dotgit or not os.path.exists(dotgit):
