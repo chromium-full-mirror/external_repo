@@ -401,6 +401,13 @@ later is required to fix a server side protocol bug.
             "WARNING: this may cause loss of data",
         )
         p.add_option(
+            "--rebase",
+            dest="rebase",
+            action="store_true",
+            help="rebase local commits regardless of whether they are "
+            "published",
+        )
+        p.add_option(
             "-l",
             "--local-only",
             dest="local_only",
@@ -1019,7 +1026,13 @@ later is required to fix a server side protocol bug.
         return _FetchMainResult(all_projects)
 
     def _CheckoutOne(
-        self, detach_head, force_sync, force_checkout, verbose, project
+        self,
+        detach_head,
+        force_sync,
+        force_checkout,
+        force_rebase,
+        verbose,
+        project,
     ):
         """Checkout work tree for one project
 
@@ -1029,6 +1042,7 @@ later is required to fix a server side protocol bug.
             existing git directory that was previously linked to a different
             object directory).
             force_checkout: Force checking out of the repo content.
+            force_rebase: Force rebase.
             verbose: Whether to show verbose messages.
             project: Project object for the project to checkout.
 
@@ -1046,6 +1060,7 @@ later is required to fix a server side protocol bug.
                 syncbuf,
                 force_sync=force_sync,
                 force_checkout=force_checkout,
+                force_rebase=force_rebase,
                 errors=errors,
                 verbose=verbose,
             )
@@ -1119,6 +1134,7 @@ later is required to fix a server side protocol bug.
                     opt.detach_head,
                     opt.force_sync,
                     opt.force_checkout,
+                    opt.rebase,
                     opt.verbose,
                 ),
                 projects,
@@ -1487,6 +1503,19 @@ later is required to fix a server side protocol bug.
 
                 if "SYNC_TARGET" in os.environ:
                     target = os.environ["SYNC_TARGET"]
+                    [success, manifest_str] = server.GetApprovedManifest(
+                        branch, target
+                    )
+                elif (
+                    "TARGET_PRODUCT" in os.environ
+                    and "TARGET_BUILD_VARIANT" in os.environ
+                    and "TARGET_RELEASE" in os.environ
+                ):
+                    target = "%s-%s-%s" % (
+                        os.environ["TARGET_PRODUCT"],
+                        os.environ["TARGET_RELEASE"],
+                        os.environ["TARGET_BUILD_VARIANT"],
+                    )
                     [success, manifest_str] = server.GetApprovedManifest(
                         branch, target
                     )

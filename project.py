@@ -752,7 +752,7 @@ class Project:
 
         def _git(*args):
             # Ignore return code, in case there was no rebase in progress.
-            GitCommand(self, *args, log_as_error=False).Wait()
+            GitCommand(self, args, log_as_error=False).Wait()
 
         _git("cherry-pick", "--abort")
         _git("rebase", "--abort")
@@ -1631,6 +1631,7 @@ class Project:
         syncbuf,
         force_sync=False,
         force_checkout=False,
+        force_rebase=False,
         submodules=False,
         errors=None,
         verbose=False,
@@ -1776,14 +1777,15 @@ class Project:
         if pub:
             not_merged = self._revlist(not_rev(revid), pub)
             if not_merged:
-                if upstream_gain:
+                if upstream_gain and not force_rebase:
                     # The user has published this branch and some of those
                     # commits are not yet merged upstream.  We do not want
                     # to rewrite the published commits so we punt.
                     fail(
                         LocalSyncFail(
                             "branch %s is published (but not merged) and is "
-                            "now %d commits behind"
+                            "now %d commits behind. Fix this manually or rerun "
+                            "with the --rebase option to force a rebase."
                             % (branch.name, len(upstream_gain)),
                             project=self.name,
                         )
@@ -2752,6 +2754,17 @@ class Project:
             ):
                 # Fallthru to sleep+retry logic at the bottom.
                 pass
+
+            # TODO(b/360889369#comment24): git may gc commits incorrectly.
+            # Until the root cause is fixed, retry fetch with --refetch which
+            # will bring the repository into a good state.
+            elif gitcmd.stdout and "could not parse commit" in gitcmd.stdout:
+                cmd.insert(1, "--refetch")
+                print(
+                    "could not parse commit error, retrying with refetch",
+                    file=output_redir,
+                )
+                continue
 
             # Try to prune remote branches once in case there are conflicts.
             # For example, if the remote had refs/heads/upstream, but deleted
