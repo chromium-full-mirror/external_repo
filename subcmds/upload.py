@@ -603,19 +603,22 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
             full_dest = destination
             if not full_dest.startswith(R_HEADS):
                 full_dest = R_HEADS + full_dest
+            full_revision = branch.project.revisionExpr
+            if not full_revision.startswith(R_HEADS):
+                full_revision = R_HEADS + full_revision
 
             # If the merge branch of the local branch is different from
             # the project's revision AND destination, this might not be
             # intentional.
             if (
                 merge_branch
-                and merge_branch != branch.project.revisionExpr
+                and merge_branch != full_revision
                 and merge_branch != full_dest
             ):
                 print(
                     f"For local branch {branch.name}: merge branch "
                     f"{merge_branch} does not match destination branch "
-                    f"{destination}"
+                    f"{destination} and revision {branch.project.revisionExpr}"
                 )
                 print("skipping upload.")
                 print(
@@ -713,16 +716,17 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
         merge_branch = p.stdout.strip()
         return merge_branch
 
-    @staticmethod
-    def _GatherOne(opt, project):
+    @classmethod
+    def _GatherOne(cls, opt, project_idx):
         """Figure out the upload status for |project|."""
+        project = cls.get_parallel_context()["projects"][project_idx]
         if opt.current_branch:
             cbr = project.CurrentBranch
             up_branch = project.GetUploadableBranch(cbr)
             avail = [up_branch] if up_branch else None
         else:
             avail = project.GetUploadableBranches(opt.branch)
-        return (project, avail)
+        return (project_idx, avail)
 
     def Execute(self, opt, args):
         projects = self.GetProjects(
@@ -732,7 +736,8 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
         def _ProcessResults(_pool, _out, results):
             pending = []
             for result in results:
-                project, avail = result
+                project_idx, avail = result
+                project = projects[project_idx]
                 if avail is None:
                     logger.error(
                         'repo: error: %s: Unable to upload branch "%s". '
@@ -743,15 +748,17 @@ Gerrit Code Review:  https://www.gerritcodereview.com/
                         project.manifest.branch,
                     )
                 elif avail:
-                    pending.append(result)
+                    pending.append((project, avail))
             return pending
 
-        pending = self.ExecuteInParallel(
-            opt.jobs,
-            functools.partial(self._GatherOne, opt),
-            projects,
-            callback=_ProcessResults,
-        )
+        with self.ParallelContext():
+            self.get_parallel_context()["projects"] = projects
+            pending = self.ExecuteInParallel(
+                opt.jobs,
+                functools.partial(self._GatherOne, opt),
+                range(len(projects)),
+                callback=_ProcessResults,
+            )
 
         if not pending:
             if opt.branch is None:
