@@ -831,6 +831,16 @@ later is required to fix a server side protocol bug.
         jobs = jobs_str(len(items))
         return f"{jobs} | {elapsed_str(elapsed)} {earliest_proj}"
 
+    @classmethod
+    def InitWorker(cls):
+        # Force connect to the manager server now.
+        # This is good because workers are initialized one by one. Without this,
+        # multiple workers may connect to the manager when handling the first
+        # job at the same time. Then the connection may fail if too many
+        # connections are pending and execeeded the socket listening backlog,
+        # especially on MacOS.
+        len(cls.get_parallel_context()["sync_dict"])
+
     def _Fetch(self, projects, opt, err_event, ssh_proxy, errors):
         ret = True
 
@@ -901,7 +911,7 @@ later is required to fix a server side protocol bug.
                 objdir_project_map.setdefault(project.objdir, []).append(index)
             projects_list = list(objdir_project_map.values())
 
-            jobs = min(opt.jobs_network, len(projects_list))
+            jobs = max(1, min(opt.jobs_network, len(projects_list)))
 
             # We pass the ssh proxy settings via the class.  This allows
             # multiprocessing to pickle it up when spawning children.  We can't
@@ -923,6 +933,7 @@ later is required to fix a server side protocol bug.
                     # idle while other workers still have more than one job in
                     # their chunk queue.
                     chunksize=1,
+                    initializer=self.InitWorker,
                 )
             finally:
                 sync_event.set()
@@ -1057,6 +1068,8 @@ later is required to fix a server side protocol bug.
                 verbose=verbose,
             )
             success = syncbuf.Finish()
+        except KeyboardInterrupt:
+            logger.error("Keyboard interrupt while processing %s", project.name)
         except GitError as e:
             logger.error(
                 "error.GitError: Cannot checkout %s: %s", project.name, e
@@ -1441,7 +1454,10 @@ later is required to fix a server side protocol bug.
             for need_remove_file in need_remove_files:
                 # Try to remove the updated copyfile or linkfile.
                 # So, if the file is not exist, nothing need to do.
-                platform_utils.remove(need_remove_file, missing_ok=True)
+                platform_utils.remove(
+                    os.path.join(self.client.topdir, need_remove_file),
+                    missing_ok=True,
+                )
 
         # Create copy-link-files.json, save dest path of "copyfile" and
         # "linkfile".
@@ -1846,7 +1862,7 @@ later is required to fix a server side protocol bug.
 
         self._fetch_times = _FetchTimes(manifest)
         self._local_sync_state = LocalSyncState(manifest)
-        if not opt.local_only:
+        if not opt.local_only and not opt.repo_upgraded:
             with multiprocessing.Manager() as manager:
                 with ssh.ProxyManager(manager) as ssh_proxy:
                     # Initialize the socket dir once in the parent.

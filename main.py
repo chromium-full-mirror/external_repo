@@ -45,7 +45,6 @@ from command import InteractiveCommand
 from command import MirrorSafeCommand
 from editor import Editor
 from error import DownloadError
-from error import GitcUnsupportedError
 from error import InvalidProjectGroupsError
 from error import ManifestInvalidRevisionError
 from error import ManifestParseError
@@ -308,10 +307,6 @@ class _Repo:
                 outer_client=outer_client,
             )
 
-        if Wrapper().gitc_parse_clientdir(os.getcwd()):
-            logger.error("GITC is not supported.")
-            raise GitcUnsupportedError()
-
         try:
             cmd = self.commands[name](
                 repodir=self.repodir,
@@ -357,7 +352,7 @@ class _Repo:
         start = time.time()
         cmd_event = cmd.event_log.Add(name, event_log.TASK_COMMAND, start)
         cmd.event_log.SetParent(cmd_event)
-        git_trace2_event_log.StartEvent()
+        git_trace2_event_log.StartEvent(["repo", name] + argv)
         git_trace2_event_log.CommandEvent(name="repo", subcommands=[name])
 
         def execute_command_helper():

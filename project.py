@@ -579,7 +579,6 @@ class Project:
         dest_branch=None,
         optimized_fetch=False,
         retry_fetches=0,
-        old_revision=None,
     ):
         """Init a Project object.
 
@@ -612,7 +611,6 @@ class Project:
                 only fetch from the remote if the sha1 is not present locally.
             retry_fetches: Retry remote fetches n times upon receiving transient
                 error with exponential backoff and jitter.
-            old_revision: saved git commit id for open GITC projects.
         """
         self.client = self.manifest = manifest
         self.name = name
@@ -642,7 +640,6 @@ class Project:
         self.linkfiles = []
         self.annotations = []
         self.dest_branch = dest_branch
-        self.old_revision = old_revision
 
         # This will be filled in if a project is later identified to be the
         # project containing repo hooks.
@@ -3542,11 +3539,18 @@ class Project:
 
                 # Finish checking out the worktree.
                 cmd = ["read-tree", "--reset", "-u", "-v", HEAD]
-                if GitCommand(self, cmd).Wait() != 0:
-                    raise GitError(
-                        "Cannot initialize work tree for " + self.name,
-                        project=self.name,
-                    )
+                try:
+                    if GitCommand(self, cmd).Wait() != 0:
+                        raise GitError(
+                            "Cannot initialize work tree for " + self.name,
+                            project=self.name,
+                        )
+                except Exception as e:
+                    # Something went wrong with read-tree (perhaps fetching
+                    # missing blobs), so remove .git to avoid half initialized
+                    # workspace from which repo can't recover on its own.
+                    platform_utils.remove(dotgit)
+                    raise e
 
                 if submodules:
                     self._SyncSubmodules(quiet=True)
