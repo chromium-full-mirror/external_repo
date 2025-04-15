@@ -350,6 +350,8 @@ later is required to fix a server side protocol bug.
     # value later on.
     PARALLEL_JOBS = 0
 
+    _JOBS_WARN_THRESHOLD = 100
+
     def _Options(self, p, show_smart=True):
         p.add_option(
             "--jobs-network",
@@ -1512,6 +1514,7 @@ later is required to fix a server side protocol bug.
         if manifest_server.startswith("persistent-"):
             manifest_server = manifest_server[len("persistent-") :]
 
+        # Changes in behavior should update docs/smart-sync.md accordingly.
         try:
             server = xmlrpc.client.Server(manifest_server, transport=transport)
             if opt.smart_sync:
@@ -1738,6 +1741,24 @@ later is required to fix a server side protocol bug.
         opt.jobs_network = min(opt.jobs_network, jobs_soft_limit)
         opt.jobs_checkout = min(opt.jobs_checkout, jobs_soft_limit)
 
+        # Warn once if effective job counts seem excessively high.
+        # Prioritize --jobs, then --jobs-network, then --jobs-checkout.
+        job_options_to_check = (
+            ("--jobs", opt.jobs),
+            ("--jobs-network", opt.jobs_network),
+            ("--jobs-checkout", opt.jobs_checkout),
+        )
+        for name, value in job_options_to_check:
+            if value > self._JOBS_WARN_THRESHOLD:
+                logger.warning(
+                    "High job count (%d > %d) specified for %s; this may "
+                    "lead to excessive resource usage or diminishing returns.",
+                    value,
+                    self._JOBS_WARN_THRESHOLD,
+                    name,
+                )
+                break
+
     def Execute(self, opt, args):
         errors = []
         try:
@@ -1862,7 +1883,7 @@ later is required to fix a server side protocol bug.
 
         self._fetch_times = _FetchTimes(manifest)
         self._local_sync_state = LocalSyncState(manifest)
-        if not opt.local_only and not opt.repo_upgraded:
+        if not opt.local_only:
             with multiprocessing.Manager() as manager:
                 with ssh.ProxyManager(manager) as ssh_proxy:
                     # Initialize the socket dir once in the parent.
@@ -2027,6 +2048,8 @@ def _PostRepoFetch(rp, repo_verify=True, verbose=False):
             # We also have to make sure this will switch to an older commit if
             # that's the latest tag in order to support release rollback.
             try:
+                # Refresh index since reset --keep won't do it.
+                rp.work_git.update_index("-q", "--refresh")
                 rp.work_git.reset("--keep", new_rev)
             except GitError as e:
                 raise RepoUnhandledExceptionError(e)

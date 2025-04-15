@@ -645,6 +645,10 @@ class Project:
         # project containing repo hooks.
         self.enabled_repo_hooks = []
 
+        # This will be updated later if the project has submodules and
+        # if they will be synced.
+        self.has_subprojects = False
+
     def RelPath(self, local=True):
         """Return the path for the project relative to a manifest.
 
@@ -1656,6 +1660,11 @@ class Project:
             return
 
         self._InitWorkTree(force_sync=force_sync, submodules=submodules)
+        # TODO(https://git-scm.com/docs/git-worktree#_bugs): Re-evaluate if
+        # submodules can be init when using worktrees once its support is
+        # complete.
+        if self.has_subprojects and not self.use_git_worktrees:
+            self._InitSubmodules()
         all_refs = self.bare_ref.all
         self.CleanPublishedCache(all_refs)
         revid = self.GetRevisionId(all_refs)
@@ -2284,24 +2293,27 @@ class Project:
 
         def get_submodules(gitdir, rev):
             # Parse .gitmodules for submodule sub_paths and sub_urls.
-            sub_paths, sub_urls = parse_gitmodules(gitdir, rev)
+            sub_paths, sub_urls, sub_shallows = parse_gitmodules(gitdir, rev)
             if not sub_paths:
                 return []
             # Run `git ls-tree` to read SHAs of submodule object, which happen
             # to be revision of submodule repository.
             sub_revs = git_ls_tree(gitdir, rev, sub_paths)
             submodules = []
-            for sub_path, sub_url in zip(sub_paths, sub_urls):
+            for sub_path, sub_url, sub_shallow in zip(
+                sub_paths, sub_urls, sub_shallows
+            ):
                 try:
                     sub_rev = sub_revs[sub_path]
                 except KeyError:
                     # Ignore non-exist submodules.
                     continue
-                submodules.append((sub_rev, sub_path, sub_url))
+                submodules.append((sub_rev, sub_path, sub_url, sub_shallow))
             return submodules
 
         re_path = re.compile(r"^submodule\.(.+)\.path=(.*)$")
         re_url = re.compile(r"^submodule\.(.+)\.url=(.*)$")
+        re_shallow = re.compile(r"^submodule\.(.+)\.shallow=(.*)$")
 
         def parse_gitmodules(gitdir, rev):
             cmd = ["cat-file", "blob", "%s:.gitmodules" % rev]
@@ -2315,9 +2327,9 @@ class Project:
                     gitdir=gitdir,
                 )
             except GitError:
-                return [], []
+                return [], [], []
             if p.Wait() != 0:
-                return [], []
+                return [], [], []
 
             gitmodules_lines = []
             fd, temp_gitmodules_path = tempfile.mkstemp()
@@ -2334,16 +2346,17 @@ class Project:
                     gitdir=gitdir,
                 )
                 if p.Wait() != 0:
-                    return [], []
+                    return [], [], []
                 gitmodules_lines = p.stdout.split("\n")
             except GitError:
-                return [], []
+                return [], [], []
             finally:
                 platform_utils.remove(temp_gitmodules_path)
 
             names = set()
             paths = {}
             urls = {}
+            shallows = {}
             for line in gitmodules_lines:
                 if not line:
                     continue
@@ -2357,10 +2370,16 @@ class Project:
                     names.add(m.group(1))
                     urls[m.group(1)] = m.group(2)
                     continue
+                m = re_shallow.match(line)
+                if m:
+                    names.add(m.group(1))
+                    shallows[m.group(1)] = m.group(2)
+                    continue
             names = sorted(names)
             return (
                 [paths.get(name, "") for name in names],
                 [urls.get(name, "") for name in names],
+                [shallows.get(name, "") for name in names],
             )
 
         def git_ls_tree(gitdir, rev, paths):
@@ -2401,7 +2420,7 @@ class Project:
             # If git repo does not exist yet, querying its submodules will
             # mess up its states; so return here.
             return result
-        for rev, path, url in self._GetSubmodules():
+        for rev, path, url, shallow in self._GetSubmodules():
             name = self.manifest.GetSubprojectName(self, path)
             (
                 relpath,
@@ -2423,6 +2442,7 @@ class Project:
                 review=self.remote.review,
                 revision=self.remote.revision,
             )
+            clone_depth = 1 if shallow.lower() == "true" else None
             subproject = Project(
                 manifest=self.manifest,
                 name=name,
@@ -2439,10 +2459,13 @@ class Project:
                 sync_s=self.sync_s,
                 sync_tags=self.sync_tags,
                 parent=self,
+                clone_depth=clone_depth,
                 is_derived=True,
             )
             result.append(subproject)
             result.extend(subproject.GetDerivedSubprojects())
+        if result:
+            self.has_subprojects = True
         return result
 
     def EnableRepositoryExtension(self, key, value="true", version=1):
@@ -2948,7 +2971,14 @@ class Project:
 
         # We do not use curl's --retry option since it generally doesn't
         # actually retry anything; code 18 for example, it will not retry on.
-        cmd = ["curl", "--fail", "--output", tmpPath, "--netrc", "--location"]
+        cmd = [
+            "curl",
+            "--fail",
+            "--output",
+            tmpPath,
+            "--netrc-optional",
+            "--location",
+        ]
         if quiet:
             cmd += ["--silent", "--show-error"]
         if os.path.exists(tmpPath):
@@ -3090,6 +3120,17 @@ class Project:
         if GitCommand(self, cmd).Wait() != 0:
             raise GitError(
                 "%s submodule update --init --recursive " % self.name,
+                project=self.name,
+            )
+
+    def _InitSubmodules(self, quiet=True):
+        """Initialize the submodules for the project."""
+        cmd = ["submodule", "init"]
+        if quiet:
+            cmd.append("-q")
+        if GitCommand(self, cmd).Wait() != 0:
+            raise GitError(
+                f"{self.name} submodule init",
                 project=self.name,
             )
 
@@ -3511,6 +3552,11 @@ class Project:
         """
         dotgit = os.path.join(self.worktree, ".git")
 
+        # If bare checkout of the submodule is stored under the subproject dir,
+        # migrate it.
+        if self.parent:
+            self._MigrateOldSubmoduleDir()
+
         # If using an old layout style (a directory), migrate it.
         if not platform_utils.islink(dotgit) and platform_utils.isdir(dotgit):
             self._MigrateOldWorkTreeGitDir(dotgit, project=self.name)
@@ -3521,20 +3567,21 @@ class Project:
                 self._InitGitWorktree()
                 self._CopyAndLinkFiles()
         else:
+            # Remove old directory symbolic links for submodules.
+            if self.parent and platform_utils.islink(dotgit):
+                platform_utils.remove(dotgit)
+                init_dotgit = True
+
             if not init_dotgit:
                 # See if the project has changed.
-                if os.path.realpath(self.gitdir) != os.path.realpath(dotgit):
-                    platform_utils.remove(dotgit)
+                self._removeBadGitDirLink(dotgit)
 
             if init_dotgit or not os.path.exists(dotgit):
-                os.makedirs(self.worktree, exist_ok=True)
-                platform_utils.symlink(
-                    os.path.relpath(self.gitdir, self.worktree), dotgit
-                )
+                self._createDotGit(dotgit)
 
             if init_dotgit:
                 _lwrite(
-                    os.path.join(dotgit, HEAD), "%s\n" % self.GetRevisionId()
+                    os.path.join(self.gitdir, HEAD), f"{self.GetRevisionId()}\n"
                 )
 
                 # Finish checking out the worktree.
@@ -3555,6 +3602,40 @@ class Project:
                 if submodules:
                     self._SyncSubmodules(quiet=True)
                 self._CopyAndLinkFiles()
+
+    def _createDotGit(self, dotgit):
+        """Initialize .git path.
+
+        For submodule projects, create a '.git' file using the gitfile
+        mechanism, and for the rest, create a symbolic link.
+        """
+        os.makedirs(self.worktree, exist_ok=True)
+        if self.parent:
+            _lwrite(
+                dotgit,
+                f"gitdir: {os.path.relpath(self.gitdir, self.worktree)}\n",
+            )
+        else:
+            platform_utils.symlink(
+                os.path.relpath(self.gitdir, self.worktree), dotgit
+            )
+
+    def _removeBadGitDirLink(self, dotgit):
+        """Verify .git is initialized correctly, otherwise delete it."""
+        if self.parent and os.path.isfile(dotgit):
+            with open(dotgit) as fp:
+                setting = fp.read()
+            if not setting.startswith("gitdir:"):
+                raise GitError(
+                    f"'.git' in {self.worktree} must start with 'gitdir:'",
+                    project=self.name,
+                )
+            gitdir = setting.split(":", 1)[1].strip()
+            dotgit_path = os.path.normpath(os.path.join(self.worktree, gitdir))
+        else:
+            dotgit_path = os.path.realpath(dotgit)
+        if os.path.realpath(self.gitdir) != dotgit_path:
+            platform_utils.remove(dotgit)
 
     @classmethod
     def _MigrateOldWorkTreeGitDir(cls, dotgit, project=None):
@@ -3643,6 +3724,28 @@ class Project:
             os.path.relpath(gitdir, os.path.dirname(os.path.realpath(dotgit))),
             dotgit,
         )
+
+    def _MigrateOldSubmoduleDir(self):
+        """Move the old bare checkout in 'subprojects' to 'modules'
+        as bare checkouts of submodules are now in 'modules' dir.
+        """
+        subprojects = os.path.join(self.parent.gitdir, "subprojects")
+        if not platform_utils.isdir(subprojects):
+            return
+
+        modules = os.path.join(self.parent.gitdir, "modules")
+        old = self.gitdir
+        new = os.path.splitext(self.gitdir.replace(subprojects, modules))[0]
+
+        if all(map(platform_utils.isdir, [old, new])):
+            platform_utils.rmtree(old, ignore_errors=True)
+        else:
+            os.makedirs(modules, exist_ok=True)
+            platform_utils.rename(old, new)
+        self.gitdir = new
+        self.UpdatePaths(self.relpath, self.worktree, self.gitdir, self.objdir)
+        if platform_utils.isdir(subprojects) and not os.listdir(subprojects):
+            platform_utils.rmtree(subprojects, ignore_errors=True)
 
     def _get_symlink_error_message(self):
         if platform_utils.isWindows():
